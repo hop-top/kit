@@ -1,0 +1,173 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      go_release_created: ${{ steps.release.outputs.release_created }}
+      go_tag_name: ${{ steps.release.outputs.tag_name }}
+      ts_release_created: ${{ steps.release.outputs['sdk/ts--release_created'] }}
+      ts_tag_name: ${{ steps.release.outputs['sdk/ts--tag_name'] }}
+      py_release_created: ${{ steps.release.outputs['sdk/py--release_created'] }}
+      py_tag_name: ${{ steps.release.outputs['sdk/py--tag_name'] }}
+      qmochi_release_created: ${{ steps.release.outputs['incubator/qmochi--release_created'] }}
+      qmochi_tag_name: ${{ steps.release.outputs['incubator/qmochi--tag_name'] }}
+      ash_release_created: ${{ steps.release.outputs['incubator/ash--release_created'] }}
+      ash_tag_name: ${{ steps.release.outputs['incubator/ash--tag_name'] }}
+      aim_release_created: ${{ steps.release.outputs['incubator/aim--release_created'] }}
+      aim_tag_name: ${{ steps.release.outputs['incubator/aim--tag_name'] }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+  release-go:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.go_release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.release-please.outputs.go_tag_name }}
+
+  release-ts:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.ts_release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @hop-top/kit exec vitest run --exclude src/sqlstore.test.ts
+      - run: pnpm --filter @hop-top/kit build
+      - run: pnpm --filter @hop-top/kit publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  release-py:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.py_release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hop-top-kit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v4
+      - working-directory: sdk/py
+        run: uv sync --all-extras
+      - working-directory: sdk/py
+        run: uv run pytest
+      - working-directory: sdk/py
+        run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/py/dist/
+
+  subtree-split:
+    needs: release-please
+    if: >-
+      needs.release-please.outputs.qmochi_release_created == 'true' ||
+      needs.release-please.outputs.ash_release_created == 'true' ||
+      needs.release-please.outputs.aim_release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - component: qmochi
+            prefix: incubator/qmochi
+            target: hop-top/qmochi
+            release_created: ${{ needs.release-please.outputs.qmochi_release_created }}
+            tag: ${{ needs.release-please.outputs.qmochi_tag_name }}
+          - component: ash
+            prefix: incubator/ash
+            target: hop-top/ash
+            release_created: ${{ needs.release-please.outputs.ash_release_created }}
+            tag: ${{ needs.release-please.outputs.ash_tag_name }}
+          - component: aim
+            prefix: incubator/aim
+            target: hop-top/aim
+            release_created: ${{ needs.release-please.outputs.aim_release_created }}
+            tag: ${{ needs.release-please.outputs.aim_tag_name }}
+    steps:
+      - if: matrix.release_created == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - if: matrix.release_created == 'true'
+        name: Split subtree and push to mirror
+        env:
+          GH_TOKEN: ${{ secrets.SUBTREE_PAT }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          # Extract version from tag (e.g. qmochi-v0.1.0-alpha.1 -> v0.1.0-alpha.1)
+          VERSION="${TAG#${{ matrix.component }}/}"
+
+          # Split subtree
+          SHA=$(git subtree split --prefix=${{ matrix.prefix }} HEAD)
+
+          # Push to mirror
+          git remote add mirror "https://x-access-token:${GH_TOKEN}@github.com/${{ matrix.target }}.git"
+          git push mirror "${SHA}:refs/heads/main" --force
+
+          # Create tag on mirror
+          git tag "${VERSION}" "${SHA}"
+          git push mirror "${VERSION}"
+
+      - if: matrix.release_created == 'true'
+        name: Create release on mirror
+        env:
+          GH_TOKEN: ${{ secrets.SUBTREE_PAT }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          VERSION="${TAG#${SION="${TAG#${{ matrix.component }}/}"
+          CHANGELOG="${{ matrix.prefix }}/CHANGELOG.md"
+          BODY=""
+          if [ -f "$CHANGELOG" ]; then
+            BODY=$(sed -n '/^## \[/,/^## \[/{ /^## \[/!p; }' "$CHANGELOG" | head -50)
+          fi
+          gh release create "${VERSION}" \
+            --repo "${{ matrix.target }}" \
+            --title "${VERSION}" \
+            --notes "${BODY:-Release ${VERSION}}"

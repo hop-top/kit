@@ -1,0 +1,24 @@
+*.test
+*.out
+/dist/
+vendor
+node_modules
+examples/spaced/web/web.js
+examples/spaced/web/web.js.map
+examples/spaced/web/test-results/
+**/__pycache__/
+examples/probe/go/probe
+examples/probe/ts/node_modules/
+examples/probe/ts/dist/
+examples/probe/py/.pytest_cache/
+
+# Composer lock (library; consumers resolve their own deps)
+php/composer.lock
+
+# uv lock (library; consumers resolve their own deps)
+py/kit-engine/uv.lock
+
+# Generated media (large binaries; regenerate via `make media`)
+examples/spaced/media/*.gif
+examples/spaced/media/*.png
+kit

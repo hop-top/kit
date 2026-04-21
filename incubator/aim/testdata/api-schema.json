@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "models.dev API response",
+  "description": "JSON Schema for https://models.dev/api.json wire format.",
+  "type": "object",
+  "additionalProperties": {
+    "$ref": "#/$defs/provider"
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "required": ["id", "name", "models"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Provider identifier (e.g. 'anthropic', 'openai')."
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable provider name."
+        },
+        "env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Environment variable names for API keys."
+        },
+        "npm": {
+          "type": "string",
+          "description": "NPM package for AI SDK integration."
+        },
+        "api": {
+          "type": "string",
+          "format": "uri",
+          "description": "Base API URL."
+        },
+        "doc": {
+          "type": "string",
+          "format": "uri",
+          "description": "Documentation URL."
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/model"
+          },
+          "description": "Map of model ID to model definition."
+        }
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Model identifier."
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable model name."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Provider ID (present when model lists differ from parent)."
+        },
+        "family": {
+          "type": "string",
+          "description": "Model family (e.g. 'claude-sonnet', 'gpt-4o')."
+        },
+        "attachment": {
+          "type": "boolean",
+          "description": "Whether the model supports file attachments."
+        },
+        "reasoning": {
+          "type": "boolean",
+          "description": "Whether the model supports chain-of-thought reasoning."
+        },
+        "tool_call": {
+          "type": "boolean",
+          "description": "Whether the model supports tool/function calling."
+        },
+        "structured_output": {
+          "type": "boolean",
+          "description": "Whether the model supports structured output."
+        },
+        "temperature": {
+          "type": "boolean",
+          "description": "Whether temperature parameter is supported."
+        },
+        "open_weights": {
+          "type": "boolean",
+          "description": "Whether model weights are openly available."
+        },
+        "experimental": {
+          "type": "boolean",
+          "description": "Whether the model is experimental."
+        },
+        "interleaved": {
+          "type": "boolean",
+          "description": "Whether the model supports interleaved content."
+        },
+        "status": {
+          "type": "string",
+          "description": "Model availability status."
+        },
+        "knowledge": {
+          "type": "string",
+          "description": "Knowledge cutoff date (YYYY-MM or YYYY-MM-DD)."
+        },
+        "release_date": {
+          "type": "string",
+          "description": "Release date (YYYY-MM-DD)."
+        },
+        "last_updated": {
+          "type": "string",
+          "description": "Last updated date (YYYY-MM-DD)."
+        },
+        "modalities": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["text", "image", "audio", "video", "pdf"]
+              }
+            },
+            "output": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["text", "image", "audio", "video"]
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cost": {
+          "type": "object",
+          "properties": {
+            "input": { "type": "number", "description": "Cost per 1M input tokens (USD)." },
+            "output": { "type": "number", "description": "Cost per 1M output tokens (USD)." },
+            "cache_read": { "type": "number" },
+            "cache_write": { "type": "number" }
+          },
+          "additionalProperties": false
+        },
+        "limit": {
+          "type": "object",
+          "properties": {
+            "context": { "type": "integer", "description": "Context window size in tokens." },
+            "output": { "type": "integer", "description": "Maximum output tokens." }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
