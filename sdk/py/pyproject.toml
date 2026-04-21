@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hop-top-kit"
-version = "0.2.1"
+version = "0.1.0-alpha.0"
 description = "Shared CLI utilities for hop-top tools — Python edition"
 requires-python = ">=3.11"
 dependencies = ["typer>=0.12", "platformdirs>=4.0", "PyYAML>=6.0", "packaging>=24.0", "rich>=13.0", "questionary>=2.0", "structlog>=24.0"]
