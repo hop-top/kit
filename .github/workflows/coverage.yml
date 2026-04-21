@@ -1,0 +1,68 @@
+name: coverage
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "Go version"
+        type: string
+        default: "stable"
+      go-version-file:
+        description: "Path to go.mod for version detection"
+        type: string
+        default: ""
+      working-directory:
+        description: "Working directory"
+        type: string
+        default: ""
+      test-timeout:
+        description: "Test timeout"
+        type: string
+        default: "5m"
+    secrets:
+      GH_PAT:
+        description: "GitHub PAT for private hop.top/* modules"
+        required: false
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      GOPRIVATE: "hop.top/*,github.com/hop-top/*"
+      GONOSUMCHECK: "hop.top/*,github.com/hop-top/*"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global url."https://${TOKEN}@github.com/hop-top".insteadOf "https://github.com/hop-top"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Run tests with coverage
+        run: |
+          go test -timeout "$TEST_TIMEOUT" -coverprofile=coverage.out -covermode=atomic ./...
+        working-directory: ${{ inputs.working-directory || '.' }}
+        env:
+          TEST_TIMEOUT: ${{ inputs.test-timeout }}
+
+      - name: Generate coverage report
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            go tool cover -func=coverage.out
+          fi
+        working-directory: ${{ inputs.working-directory || '.' }}
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        if: always()
+        with:
+          files: ${{ inputs.working-directory && format('{0}/coverage.out', inputs.working-directory) || 'coverage.out' }}
+          fail_ci_if_error: false

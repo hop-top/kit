@@ -1,0 +1,126 @@
+name: Job Engine Integration Tests
+
+on:
+  push:
+    paths: ['go/runtime/job/**', '.github/workflows/job-integration.yml']
+  pull_request:
+    paths: ['go/runtime/job/**', '.github/workflows/job-integration.yml']
+
+env:
+  GOPRIVATE: "hop.top/*,github.com/hop-top/*"
+  GONOSUMCHECK: "hop.top/*,github.com/hop-top/*"
+
+jobs:
+  core:
+    name: Core + Mock + DurableTask
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global \
+            url."https://${TOKEN}@github.com/hop-top".insteadOf \
+            "https://github.com/hop-top"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go test ./go/runtime/job/... -count=1
+
+  hatchet:
+    name: Hatchet Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global \
+            url."https://${TOKEN}@github.com/hop-top".insteadOf \
+            "https://github.com/hop-top"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # TODO: enable when live integration tests exist
+      # - name: Start Hatchet stack
+      #   run: docker compose -f go/runtime/job/hatchet/testdata/docker-compose.yml up -d --wait --wait-timeout 60
+
+      - name: Run integration tests
+        run: go test -tags hatchet ./go/runtime/job/hatchet/... -count=1 -timeout 120s
+
+      # TODO: enable when live integration tests exist
+      # - name: Teardown
+      #   if: always()
+      #   run: docker compose -f go/runtime/job/hatchet/testdata/docker-compose.yml down -v
+
+  restate:
+    name: Restate Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global \
+            url."https://${TOKEN}@github.com/hop-top".insteadOf \
+            "https://github.com/hop-top"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # TODO: enable when live integration tests exist
+      # - name: Start Restate
+      #   run: docker compose -f go/runtime/job/restate/testdata/docker-compose.yml up -d --wait --wait-timeout 60
+
+      - name: Run integration tests
+        run: go test -tags restate ./go/runtime/job/restate/... -count=1 -timeout 120s
+
+      # TODO: enable when live integration tests exist
+      # - name: Teardown
+      #   if: always()
+      #   run: docker compose -f go/runtime/job/restate/testdata/docker-compose.yml down -v
+
+  temporal:
+    name: Temporal Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global \
+            url."https://${TOKEN}@github.com/hop-top".insteadOf \
+            "https://github.com/hop-top"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # TODO: enable when live integration tests exist
+      # - name: Start Temporal
+      #   run: docker compose -f go/runtime/job/temporal/testdata/docker-compose.yml up -d --wait --wait-timeout 60
+
+      - name: Run integration tests
+        run: go test -tags temporal ./go/runtime/job/temporal/... -count=1 -timeout 120s
+
+      # TODO: enable when live integration tests exist
+      # - name: Teardown
+      #   if: always()
+      #   run: docker compose -f go/runtime/job/temporal/testdata/docker-compose.yml down -v
