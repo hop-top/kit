@@ -1,0 +1,44 @@
+name: lint
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "Go version"
+        type: string
+        default: "stable"
+      working-directory:
+        description: "Working directory"
+        type: string
+        default: ""
+    secrets:
+      GH_PAT:
+        description: "GitHub PAT for private hop.top/* modules"
+        required: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      GOPRIVATE: "hop.top/*,github.com/hop-top/*"
+      GONOSUMCHECK: "hop.top/*,github.com/hop-top/*"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global url."https://${TOKEN}@github.com/hop-top".insteadOf "https://github.com/hop-top"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: ${{ inputs.working-directory || '.' }}

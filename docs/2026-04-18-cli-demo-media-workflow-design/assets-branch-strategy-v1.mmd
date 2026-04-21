@@ -1,0 +1,46 @@
+flowchart TD
+    subgraph PR["Pull Request Trigger"]
+        A[workflow_call] --> B[checkout source]
+        B --> C{assets branch\nexists?}
+    end
+
+    subgraph Setup["Assets Branch Setup"]
+        C -- yes --> D[git worktree add\nRUNNER_TEMP/assets-worktree]
+        C -- no  --> E[orphan branch\ngit worktree add --orphan]
+        E --> F[seed commit + push]
+        F --> D
+    end
+
+    subgraph Record["Recording Pipeline"]
+        D --> G[build-command]
+        G --> H{record-command\n== vhs?}
+        H -- yes --> I[vhs-action@v2\ninstall-only]
+        H -- no  --> J[skip VHS install]
+        I --> K[expand tape-files glob]
+        J --> K
+        K --> L[record-command per tape]
+        L --> M{screenshot-command\nset?}
+        M -- yes --> N[run screenshot-command]
+        M -- no  --> O[skip screenshots]
+        N --> O
+    end
+
+    subgraph Commit["Commit to Assets Branch"]
+        O --> P["copy media-dir/\n→ worktree/assets/PR_NUM/"]
+        P --> Q{changes?}
+        Q -- no  --> R[skip commit\nno-op]
+        Q -- yes --> S["git commit\n'chore: media PR#N [skip ci]'\ngit push origin assets"]
+    end
+
+    subgraph Comment["PR Comment"]
+        S --> T[find-comment\nmarker: cli-demo-media]
+        R --> T
+        T --> U[build body\nraw.githubusercontent.com URLs]
+        U --> V[create-or-update-comment\nedit-mode: replace]
+    end
+
+    style PR fill:#1e293b,color:#e2e8f0
+    style Setup fill:#1e3a5f,color:#e2e8f0
+    style Record fill:#1f3a1f,color:#e2e8f0
+    style Commit fill:#3a2a1f,color:#e2e8f0
+    style Comment fill:#2a1f3a,color:#e2e8f0

@@ -1,0 +1,46 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "Go version"
+        type: string
+        default: "stable"
+      go-version-file:
+        description: "Path to go.mod for version detection"
+        type: string
+        default: ""
+      working-directory:
+        description: "Working directory"
+        type: string
+        default: ""
+    secrets:
+      GH_PAT:
+        description: "GitHub PAT for private hop.top/* modules"
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GOPRIVATE: "hop.top/*,github.com/hop-top/*"
+      GONOSUMCHECK: "hop.top/*,github.com/hop-top/*"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure private modules
+        env:
+          TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          git config --global url."https://${TOKEN}@github.com/hop-top".insteadOf "https://github.com/hop-top"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Build
+        run: go build ./...
+        working-directory: ${{ inputs.working-directory || '.' }}
