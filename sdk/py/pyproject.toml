@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hop-top-kit"
+version = "0.4.0-alpha.1"
+description = "Shared CLI utilities for hop-top tools — Python edition"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "platformdirs>=4.0",
+    "PyYAML>=6.0",
+    "packaging>=24.0",
+    "rich>=13.0",
+    "questionary>=2.0",
+    "structlog>=24.0",
+    "pathspec>=1.1.1",
+    "jinja2>=3.1.6",
+    "hop-top-uri>=0.2.0a0",
+    "typeid-python>=0.3.9,<0.4",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "typer[all]>=0.12", "ruff>=0.8"]
+# Optional HTTPS sink for the telemetry client. The JSONL sink works
+# without it; only adopters who emit to a remote NDJSON collector need
+# httpx pulled in.
+telemetry-https = ["httpx>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hop_top_kit"]
