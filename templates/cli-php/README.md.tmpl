@@ -1,0 +1,79 @@
+# {{.Name}}
+
+{{.Description}}
+
+## Install
+
+```sh
+composer global require {{.Vendor}}/{{.Name}}
+```
+
+## Usage
+
+```sh
+{{.Name}} --help
+{{.Name}} --version
+```
+
+### Output formats
+
+Every command supports the kit output flag suite:
+
+```sh
+{{.Name}} list --format json
+{{.Name}} list --format yaml
+{{.Name}} list --cols name,status
+{{.Name}} list -o results.json   # ext infers format
+{{.Name}} list --format-help     # show all formats + options
+```
+
+### Commands
+
+```sh
+{{.Name}} hello                  # Hello, World!
+{{.Name}} hello Alice            # Hello, Alice!
+{{.Name}} list                   # exercise the output flag suite
+```
+
+## Getting started
+
+Toolchain is pinned in `mise.toml`. Install everything in one go:
+
+```sh
+mise install                # installs PHP/Composer (and other pinned tools)
+mise run install            # installs ecosystem deps (composer install)
+cp .env.example .env        # adapter defaults (telemetry, storage, queue, log, config)
+```
+
+Optional — start telemetry services (otel-collector + jaeger):
+
+```sh
+docker compose -f .devcontainer/docker-compose.yml up -d
+open http://localhost:16686 # Jaeger UI for traces
+```
+
+## Tool versions
+
+PHP, Composer, and release tooling are pinned in `mise.toml`
+inside a kit-managed block. Refresh procedure
+(`kit init --check` / `kit init --update`) is documented in
+poly-kit's
+[templates/RUNBOOK-UPGRADE.md](https://github.com/hop-top/poly-kit/blob/main/templates/RUNBOOK-UPGRADE.md).
+
+## Development
+
+Prerequisites: `mise` (installs the pinned PHP + Composer toolchain).
+
+```sh
+make setup       # install deps
+make check       # lint + test + link check
+make test        # phpunit
+make lint        # phpstan
+```
+
+## License
+
+See [LICENSE](LICENSE).
+
+---
+Maintained by {{.Author}}.
