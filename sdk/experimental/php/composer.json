@@ -1,0 +1,34 @@
+{
+  "name": "hop-top/kit",
+  "description": "Cross-language CLI UX parity toolkit",
+  "type": "library",
+  "license": "MIT",
+  "version": "0.4.0-alpha.2",
+  "require": {
+    "php": "^8.4",
+    "guzzlehttp/guzzle": "^7.9",
+    "hop-top/uri": "^0.2.0@alpha",
+    "jewei/typeid-php": "^1.1",
+    "laravel/prompts": "^0.3",
+    "symfony/console": "^7.0",
+    "symfony/event-dispatcher": "^7.0",
+    "symfony/yaml": "^7.0"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11",
+    "phpstan/phpstan": "^2.1"
+  },
+  "autoload": {
+    "psr-4": {
+      "HopTop\\Kit\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "HopTop\\Kit\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit"
+  }
+}

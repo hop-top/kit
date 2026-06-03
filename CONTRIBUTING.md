@@ -1,0 +1,91 @@
+# Contributing to kit
+
+Thanks for your interest in contributing!
+
+## Getting Started
+
+1. Fork the repository
+2. Clone your fork locally
+3. Create a feature branch: `git checkout -b feat/my-change`
+4. Make your changes
+5. Run tests: `make test`
+6. Commit using
+   [Conventional Commits](https://conventionalcommits.org)
+7. Push and open a Pull Request
+
+## Development Setup
+
+See the [.devcontainer/README.md](.devcontainer/README.md) file for detailed instructions on setting up your environment.
+
+Quick start:
+```sh
+make setup
+```
+
+## Git Hooks
+
+This repo ships Git hooks in `.githooks/` to catch common mistakes locally before they hit CI:
+
+- `pre-push` — refuses direct pushes to `main`/`master` (open a PR instead) and runs affected linters/tests against the changes being pushed. Bypass with `git push --no-verify` for emergencies.
+
+To install (per-clone, idempotent):
+
+```sh
+bash scripts/install-hooks.sh
+```
+
+This sets `core.hooksPath=.githooks` for the current clone. CI does not require it.
+
+## Code Style
+
+- Follow existing conventions in the codebase
+- Run linters before submitting: `make lint`
+- Keep changes focused; one concern per PR
+
+## Commit Messages
+
+Use [Conventional Commits](https://conventionalcommits.org):
+
+```
+feat(scope): add new feature
+fix(scope): correct a bug
+docs: update readme
+test: add missing tests
+```
+
+## Pull Requests
+
+- Reference related issues in the PR description
+- Keep PRs small and reviewable
+- Ensure CI passes before requesting review
+- Update documentation if behavior changes
+
+## Templates Mirror Sync
+
+The `templates/` tree (canonical source) and `internal/template/builtins/`
+(Go embed mirror used by `kit init` at runtime) must stay byte-identical
+for every file that exists in both. The `mirror-sync` workflow enforces
+this on every PR touching either path.
+
+Scaffolder-only files (e.g. `build.sh`, `scaffold.sh`, `test-*.sh`,
+`lib.sh`, `tests/`, `dist/`) live in `templates/` and are intentionally
+NOT mirrored.
+
+When editing `templates/cli-*/...` or `templates/shared/...`, mirror your
+change to `internal/template/builtins/...`. Locally:
+
+```sh
+make check-mirror-sync     # verify
+make builtins-sync         # regenerate the embed mirror from templates/
+```
+
+## Issues
+
+- Search existing issues before opening a new one
+- Use issue templates when available
+- Provide reproduction steps for bugs
+
+## Code of Conduct
+
+Be respectful and constructive. We are all here to build
+something great together.
