@@ -1,0 +1,18 @@
+packages:
+  - sdk/ts
+  - examples/spaced/ts
+  - engine/sdk/ts-kit-engine
+# pnpm 11 strictDepBuilds: deps with install scripts must be explicitly
+# allowed (true) or denied (false). Without an entry, pnpm install exits 1.
+# See dotgithub SKILL.md "pnpm 11 strictDepBuilds blocks install on
+# transitive postinstalls" for context.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+# pnpm 11 default flip: confirmModulesPurge prompts before wiping a
+# stale node_modules dir. Without a TTY (pre-push hook, make targets,
+# CI runners that don't set CI=true) the prompt aborts with
+# ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY. Setting to false makes
+# pnpm install idempotent across local + CI; same family of pnpm 11
+# default flip as the strictDepBuilds gate above.
+confirmModulesPurge: false
