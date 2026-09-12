@@ -1,0 +1,67 @@
+name: CI (Python)
+
+on:
+  push:
+    branches: [main]
+    paths: ["**.py", "pyproject.toml", "requirements*.txt", "uv.lock"]
+  pull_request:
+    branches: [main]
+    paths: ["**.py", "pyproject.toml", "requirements*.txt", "uv.lock"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # >>> kit-managed: toolchain >>>
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+      - run: mise run install
+      # <<< kit-managed: toolchain <<<
+
+      - name: Ruff check
+        run: mise exec -- uv run ruff check .
+
+      - name: Ruff format check
+        run: mise exec -- uv run ruff format --check .
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # >>> kit-managed: toolchain >>>
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+      - run: mise run install
+      # <<< kit-managed: toolchain <<<
+
+      - name: Mypy
+        run: mise exec -- uv run mypy .
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # >>> kit-managed: toolchain >>>
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+      - run: mise run install
+      # <<< kit-managed: toolchain <<<
+
+      - name: Pytest
+        run: mise exec -- uv run pytest --cov -v
