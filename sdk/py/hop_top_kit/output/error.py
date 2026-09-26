@@ -1,0 +1,412 @@
+"""Structured-error envelope — mirrors ``go/console/output/error.go``.
+
+When a command fails under ``--format json|yaml``, the error is
+materialized as a structured :class:`CLIError` and rendered to stderr by
+:func:`render_error`. Plaintext mode (``--format table`` or unset) prints
+``"Code: Message\\nFix: ...\\n"`` so the human-readable behavior matches
+the Go kit output.
+
+Wire keys are snake_case (``code``, ``message``, ``cause``,
+``suggested_fix``, ``alternatives``, ``exit_code``, ``transience``);
+empty optional fields are omitted, mirroring Go's ``omitempty``.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, replace
+from typing import IO, Any
+
+import yaml
+
+# ---------------------------------------------------------------------------
+# Transience classes
+# ---------------------------------------------------------------------------
+
+#: Marks a failure a retry may clear (rate limit, timeout, upstream blip).
+TRANSIENCE_TRANSIENT = "transient"
+#: Marks a failure retrying cannot clear without changing the input or
+#: the environment.
+TRANSIENCE_PERMANENT = "permanent"
+#: Marks a failure kit cannot classify. Agents should treat retries as
+#: best-effort and bounded.
+TRANSIENCE_UNKNOWN = "unknown"
+
+# ---------------------------------------------------------------------------
+# Standard codes mapping the cross-tool exit codes (conventions §8.1)
+# ---------------------------------------------------------------------------
+
+CODE_OK = "OK"  # exit 0
+CODE_GENERIC = "GENERIC"  # exit 1
+CODE_USAGE = "USAGE"  # exit 2
+CODE_NOT_FOUND = "NOT_FOUND"  # exit 3
+CODE_CONFLICT = "CONFLICT"  # exit 4
+CODE_UNAUTHORIZED = "UNAUTHORIZED"  # exit 5
+CODE_TRANSIENT = "TRANSIENT"  # exit 6 — Factor-11 transient/retryable failure
+CODE_CONSENT_REFUSED = "CONSENT_REFUSED"  # exit 7 — confirmation gate declined
+CODE_PROVENANCE_MISSING = "PROVENANCE_MISSING"  # exit 65 — Factor-12 strict-mode refusal
+CODE_RATE_LIMITED = "RATE_LIMITED"  # exit 64 — Factor-10 max-ops budget exceeded
+CODE_PREREQUISITE = "PREREQUISITE"  # exit 70 — declared dependency unreachable
+
+#: Success. Present for completeness so a table of the full taxonomy can
+#: be written without a bare 0.
+EXIT_OK = 0
+#: Spec-assigned exit code for the generic failure class: the command
+#: failed and no narrower code applies. Pair it with :func:`generic_error`
+#: rather than hand-rolling exit 1, so the envelope carries a transience
+#: class.
+EXIT_GENERIC = 1
+#: The caller's invocation being wrong: an unknown flag, a missing
+#: argument, a value the command cannot parse. Permanent by
+#: construction — the same argv fails identically.
+EXIT_USAGE = 2
+#: A named resource the command could not locate.
+EXIT_NOT_FOUND = 3
+#: A request that cannot be satisfied against the current state: a
+#: precondition failed, a write raced, an identifier is already taken.
+EXIT_CONFLICT = 4
+#: An authentication or authorization refusal. Permanent: the caller
+#: needs new credentials or a different policy, not a retry. Distinct
+#: from :data:`EXIT_CONSENT_REFUSED`, which a re-invocation with
+#: ``--confirm=yes`` clears.
+EXIT_UNAUTHORIZED = 5
+#: Spec-assigned exit code for transient/retryable failures (Factor 11).
+#: Agents branch on it before parsing stderr: exit 6 means a retry may
+#: clear the failure.
+EXIT_TRANSIENT = 6
+#: Exit code for a confirmation gate that declined to run a destructive
+#: operation (``--confirm=no``, the non-TTY default, a missing or
+#: mismatched ``--confirm-token``, or ``N`` at the prompt). Classified
+#: transient: re-invoking with ``--confirm=yes`` clears it. Distinct
+#: from :data:`CODE_UNAUTHORIZED` at exit 5, which is permanent because
+#: no confirmation can clear a policy denial.
+EXIT_CONSENT_REFUSED = 7
+#: Conventional exit code for Factor-10 rate-limit refusals.
+EXIT_RATE_LIMITED = 64
+#: Conventional exit code for Factor-12 strict-mode provenance refusals.
+#: Lives at 65 in kit's extension band (alongside RATE_LIMITED at 64):
+#: the spec reserves 0-6 for its core taxonomy and leaves >6 to per-tool
+#: codes, and kit as a library stays out of the low per-tool range.
+EXIT_PROVENANCE_MISSING = 65
+#: Exit code for a declared external dependency kit could not contact:
+#: nothing listening on the configured endpoint, connection refused,
+#: dial timeout. Separates a correct invocation whose logic never ran
+#: from the uncharacterized failures on exit 1. Classified transient,
+#: but deliberately not :data:`CODE_TRANSIENT`: a dependency that is not
+#: running never comes up on its own, so the caller repairs the
+#: environment instead of backing off.
+EXIT_PREREQUISITE = 70
+
+
+def transience_for_code(code: str) -> str:
+    """Return the default transience class for a standard code.
+
+    Unrecognized (adopter-defined) codes map to
+    :data:`TRANSIENCE_UNKNOWN`; adopters set ``CLIError.transience`` (or
+    use :meth:`CLIError.with_transience`) to classify their own codes.
+    """
+    if code in (
+        CODE_USAGE,
+        CODE_NOT_FOUND,
+        CODE_CONFLICT,
+        CODE_UNAUTHORIZED,
+        CODE_PROVENANCE_MISSING,
+    ):
+        return TRANSIENCE_PERMANENT
+    if code in (
+        CODE_RATE_LIMITED,
+        CODE_TRANSIENT,
+        CODE_CONSENT_REFUSED,
+        CODE_PREREQUISITE,
+    ):
+        return TRANSIENCE_TRANSIENT
+    return TRANSIENCE_UNKNOWN
+
+
+#: The class-symbol-to-exit-code relation, as data. Mirrors Go's
+#: ``exitCodeForClass`` in ``go/console/output/envelope/exitcodes.go``.
+#:
+#: Expressed as a table rather than as constants plus trailing comments
+#: because the string-to-number relationship is the thing consumers
+#: actually need, and a comment cannot be consumed — nor can it be
+#: checked against the cross-language contract. Pinned against
+#: ``contracts/exit-taxonomy-v1/taxonomy.json`` by
+#: ``tests/test_taxonomy_contract.py``.
+#:
+#: Scope is the classes kit itself owns. The conformance band's
+#: tool-specific slots (66 LEAK_DETECTED, 67 CONFIG, 68 GRADE_FAIL,
+#: 69 GRADE_UNGRADABLE) are deliberately absent: they are declared by the
+#: packages that own them.
+_EXIT_CODE_FOR_CLASS: dict[str, int] = {
+    CODE_OK: EXIT_OK,
+    CODE_GENERIC: EXIT_GENERIC,
+    CODE_USAGE: EXIT_USAGE,
+    CODE_NOT_FOUND: EXIT_NOT_FOUND,
+    CODE_CONFLICT: EXIT_CONFLICT,
+    CODE_UNAUTHORIZED: EXIT_UNAUTHORIZED,
+    CODE_TRANSIENT: EXIT_TRANSIENT,
+    CODE_CONSENT_REFUSED: EXIT_CONSENT_REFUSED,
+    CODE_RATE_LIMITED: EXIT_RATE_LIMITED,
+    CODE_PROVENANCE_MISSING: EXIT_PROVENANCE_MISSING,
+    CODE_PREREQUISITE: EXIT_PREREQUISITE,
+}
+
+
+def exit_code_for_class(code: str) -> int | None:
+    """Resolve a standard class symbol to its numeric exit code.
+
+    Returns ``None`` for adopter-defined and tool-specific codes.
+    Callers that must produce a number for an unknown class decide
+    their own fallback; this function does not pick one. A built-in
+    fallback turns "this class was added to kit and never copied here"
+    into an assertion against exit 1 that looks like a real failure
+    rather than a stale table.
+    """
+    return _EXIT_CODE_FOR_CLASS.get(code)
+
+
+def exit_classes() -> list[str]:
+    """Return the class symbols kit defines, in ascending exit order.
+
+    Ties are broken by symbol. Callers rendering the taxonomy iterate
+    this rather than hard-coding rows, so a class added above appears
+    without a second edit.
+    """
+    return sorted(_EXIT_CODE_FOR_CLASS, key=lambda c: (_EXIT_CODE_FOR_CLASS[c], c))
+
+
+@dataclass
+class CLIError(Exception):
+    """Structured-error envelope rendered to stderr for ``json``/``yaml``.
+
+    ``transience`` classifies the failure for retry decisions (Factor 4):
+    :data:`TRANSIENCE_TRANSIENT` (retry-worthy),
+    :data:`TRANSIENCE_PERMANENT` (do not retry), or
+    :data:`TRANSIENCE_UNKNOWN`. Constructors and :func:`wrap_error`
+    populate it; :func:`render_error` normalizes an unset value to
+    :data:`TRANSIENCE_UNKNOWN` so every structured error carries a valid
+    class on the wire.
+    """
+
+    code: str = ""
+    message: str = ""
+    cause: str = ""
+    suggested_fix: str = ""
+    alternatives: list[str] = field(default_factory=list)
+    exit_code: int = 0
+    transience: str = ""
+
+    def __post_init__(self) -> None:
+        # Populate Exception.args so pickling / repr behave.
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        if not self.code:
+            return self.message
+        return f"{self.code}: {self.message}"
+
+    def with_transience(self, transience: str) -> CLIError:
+        """Return a copy with ``transience`` set, other fields untouched.
+
+        Copies rather than mutating: adopters commonly share module-level
+        envelopes, and writing to one would leak across call sites.
+        """
+        return replace(self, transience=transience)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Wire form: snake_case keys, empty optional fields omitted."""
+        d: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.cause:
+            d["cause"] = self.cause
+        if self.suggested_fix:
+            d["suggested_fix"] = self.suggested_fix
+        if self.alternatives:
+            d["alternatives"] = list(self.alternatives)
+        d["exit_code"] = self.exit_code
+        if self.transience:
+            d["transience"] = self.transience
+        return d
+
+
+def wrap_error(err: BaseException | None, code: str, exit_code: int) -> CLIError | None:
+    """Build an envelope from *err*, retaining it as ``__cause__``.
+
+    Transience defaults from the code via :func:`transience_for_code`;
+    use :meth:`CLIError.with_transience` to override. Returns ``None``
+    for ``None`` input, mirroring Go's ``WrapError(nil, ...)``.
+    """
+    if err is None:
+        return None
+    e = CLIError(
+        code=code,
+        message=str(err),
+        exit_code=exit_code,
+        transience=transience_for_code(code),
+    )
+    e.__cause__ = err
+    return e
+
+
+def generic_error(message: str) -> CLIError:
+    """CODE_GENERIC envelope with exit code 1.
+
+    The catch-all for failures no narrower code describes; permanent
+    because retrying the same input in the same environment is not
+    expected to help. Wrapping an arbitrary error as CODE_GENERIC via
+    :func:`wrap_error` still defaults to :data:`TRANSIENCE_UNKNOWN`.
+    """
+    return CLIError(
+        code=CODE_GENERIC,
+        message=message,
+        exit_code=EXIT_GENERIC,
+        transience=TRANSIENCE_PERMANENT,
+    )
+
+
+def not_found_error(message: str) -> CLIError:
+    """CODE_NOT_FOUND envelope with exit code 3."""
+    return CLIError(
+        code=CODE_NOT_FOUND, message=message, exit_code=3, transience=TRANSIENCE_PERMANENT
+    )
+
+
+def conflict_error(message: str) -> CLIError:
+    """CODE_CONFLICT envelope with exit code 4."""
+    return CLIError(
+        code=CODE_CONFLICT, message=message, exit_code=4, transience=TRANSIENCE_PERMANENT
+    )
+
+
+def unauthorized_error(message: str) -> CLIError:
+    """CODE_UNAUTHORIZED envelope with exit code 5."""
+    return CLIError(
+        code=CODE_UNAUTHORIZED, message=message, exit_code=5, transience=TRANSIENCE_PERMANENT
+    )
+
+
+def usage_error(message: str) -> CLIError:
+    """CODE_USAGE envelope with exit code 2."""
+    return CLIError(code=CODE_USAGE, message=message, exit_code=2, transience=TRANSIENCE_PERMANENT)
+
+
+def transient_error(message: str) -> CLIError:
+    """CODE_TRANSIENT envelope with exit code 6 (Factor 11).
+
+    Use it for failures a retry may clear: upstream timeouts, connection
+    resets, service-unavailable responses.
+    """
+    return CLIError(
+        code=CODE_TRANSIENT,
+        message=message,
+        exit_code=EXIT_TRANSIENT,
+        transience=TRANSIENCE_TRANSIENT,
+    )
+
+
+def consent_refused_error(message: str) -> CLIError:
+    """CODE_CONSENT_REFUSED envelope with exit code 7.
+
+    Use it when a confirmation gate declines to run a destructive
+    operation: ``--confirm=no``, the non-TTY default, a missing or
+    mismatched ``--confirm-token``, or ``N`` at the prompt.
+
+    Classified transient: the caller clears it by re-invoking with
+    ``--confirm=yes`` (or the matching token). Do not use it for policy
+    denials, which no confirmation can clear — those stay
+    :func:`unauthorized_error` and permanent.
+    """
+    return CLIError(
+        code=CODE_CONSENT_REFUSED,
+        message=message,
+        exit_code=EXIT_CONSENT_REFUSED,
+        transience=TRANSIENCE_TRANSIENT,
+    )
+
+
+def prerequisite_error(message: str) -> CLIError:
+    """CODE_PREREQUISITE envelope with exit code 70.
+
+    Use it when a declared external dependency could not be contacted:
+    nothing listening on the configured endpoint, connection refused,
+    dial timeout.
+
+    Classified transient: the operator starts the dependency and the
+    same command succeeds. Do not use it for a dependency that answered
+    and then misbehaved — that is :func:`generic_error` — nor for one
+    that was never configured, which is :func:`usage_error`.
+    """
+    return CLIError(
+        code=CODE_PREREQUISITE,
+        message=message,
+        exit_code=EXIT_PREREQUISITE,
+        transience=TRANSIENCE_TRANSIENT,
+    )
+
+
+def rate_limited_error(message: str) -> CLIError:
+    """CODE_RATE_LIMITED envelope with exit code 64 (Factor 10)."""
+    return CLIError(
+        code=CODE_RATE_LIMITED,
+        message=message,
+        exit_code=EXIT_RATE_LIMITED,
+        transience=TRANSIENCE_TRANSIENT,
+    )
+
+
+def provenance_missing_error(detail: str) -> CLIError:
+    """CODE_PROVENANCE_MISSING envelope with exit code 65 (Factor 12).
+
+    *detail* is a free-form string suitable for the ``cause`` slot
+    (typically the JSON-pointer list of offending fields).
+    """
+    return CLIError(
+        code=CODE_PROVENANCE_MISSING,
+        message="provenance not recorded for one or more output fields",
+        cause=detail,
+        suggested_fix="record provenance for synthesized/cached fields "
+        "before rendering (see hop_top_kit.provenance)",
+        exit_code=EXIT_PROVENANCE_MISSING,
+        transience=TRANSIENCE_PERMANENT,
+    )
+
+
+def render_error(w: IO[str], format: str, err: CLIError | None) -> None:
+    """Write *err* to *w* in the requested format.
+
+    ``format == ""`` or ``"table"`` renders human-readable plain text
+    (``"Code: Message\\nFix: ..."``); ``json``/``yaml`` render the
+    envelope structurally. An unset transience is normalized to
+    :data:`TRANSIENCE_UNKNOWN` on the wire (Factor 4) without mutating
+    *err*. Always returns; the caller decides the exit code from
+    ``err.exit_code`` after rendering.
+    """
+    if err is None:
+        return
+    if not err.transience:
+        err = err.with_transience(TRANSIENCE_UNKNOWN)
+    if format == "json":
+        json.dump(err.to_dict(), w, indent=2)
+        w.write("\n")
+        return
+    if format == "yaml":
+        yaml.safe_dump(err.to_dict(), w, default_flow_style=False, sort_keys=False)
+        return
+    _render_plain(w, err)
+
+
+def _render_plain(w: IO[str], err: CLIError) -> None:
+    """Human-readable form used by ``--format table`` / empty format.
+
+    Each populated field appears on its own line so the output is
+    grep-friendly.
+    """
+    if err.code:
+        w.write(f"{err.code}: {err.message}\n")
+    else:
+        w.write(f"{err.message}\n")
+    if err.cause:
+        w.write(f"Cause: {err.cause}\n")
+    if err.suggested_fix:
+        w.write(f"Fix: {err.suggested_fix}\n")
+    for alt in err.alternatives:
+        w.write(f"Alternative: {alt}\n")
