@@ -1,0 +1,64 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    paths:
+      - .venv
+      - node_modules
+      - vendor
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+  disable:
+    - depguard
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*archive/tar.Writer).Close
+        - (*compress/gzip.Reader).Close
+        - (*compress/gzip.Writer).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (*os.File).Close
+        - (*text/tabwriter.Writer).Flush
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fscanln
+        - fmt.Sscanf
+        - os.Remove
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unused
+      - path: go/ai/llm/routellm/
+        linters:
+          - unused
+      - path: go/runtime/job/hatchet/
+        linters:
+          - unused
+      - path: go/runtime/job/restate/
+        linters:
+          - unused
+      - path: go/runtime/job/temporal/
+        linters:
+          - unused
+    paths:
+      - .venv
+      - node_modules
+      - vendor
