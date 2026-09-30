@@ -1,0 +1,253 @@
+package cmdsurface
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// Invocation is a single addressable command call, transport-agnostic.
+// Surface implementations decode their wire format into this shape and
+// hand it to a Runner via the Bridge.
+type Invocation struct {
+	// Path is the cobra command path from root to leaf, e.g.
+	// ["widget","add"]. Empty Path selects the root.
+	Path []string `json:"path"`
+	// Args are positional arguments passed after the path. They are
+	// arguments however they are spelled: a value starting with "-"
+	// is never read as a flag.
+	Args []string `json:"args,omitempty"`
+	// Flags is the parsed flag set keyed by long-name. Values are
+	// typed as the surface produced them; the Runner normalises to
+	// cobra string-flag form at apply time.
+	Flags map[string]any `json:"flags,omitempty"`
+	// Meta carries caller identity, originating surface, and trace
+	// context. Always populate Meta.Surface — the policy gate keys
+	// on it.
+	Meta Meta `json:"meta"`
+
+	// ownArgv marks a leaf that parses its own argv (cobra's
+	// DisableFlagParsing): its Args are forwarded verbatim, with no
+	// end-of-options marker ahead of them. The bridge sets it on
+	// admission so a runner holding no tree still knows.
+	ownArgv bool
+}
+
+// Meta carries provenance for an Invocation. Surfaces fill the
+// fields they have evidence for; the policy gate, the permission
+// gate, and audit sinks read what is present.
+//
+// Every field is transport-agnostic so a sink sees one shape whether
+// the call arrived over HTTP, a Unix socket, MCP, or a bus. A
+// transport with an authenticator fills Caller and Tenant from the
+// verified identity; a transport without one records the caller's
+// claim as provenance and grants nothing on its basis.
+//
+// Established is what tells the two apart: only the transport sets
+// it, and only when it established who is calling. The bridge's
+// authentication gate reads nothing else.
+type Meta struct {
+	// Caller is a stable identifier for the originating principal
+	// (user id, service account, webhook source). Format is
+	// surface-defined; the bridge does not parse it. Without
+	// Established it is a claim.
+	Caller string `json:"caller,omitempty"`
+	// Established records how the transport established the
+	// caller's identity: [EstablishedVerified] when a configured
+	// verifier accepted a credential, [EstablishedTransport] when
+	// the transport itself proves the caller (the socket's
+	// owner-only file, the stdio spawn). Empty means nothing was
+	// established, whatever Caller says.
+	//
+	// It is never serialized, so no message body, frame or payload
+	// can set it: a transport sets it from its own verdict after
+	// decoding. A leaf declaring kit/auth-required runs on a remote
+	// surface only when it is set (see [Bridge.Admit]).
+	Established Establishment `json:"-"`
+	// Tenant is the tenant or organization the principal acts
+	// within, when the surface's authentication carries one. Empty
+	// for single-tenant tools and for surfaces without an
+	// authenticator.
+	Tenant string `json:"tenant,omitempty"`
+	// Surface is the transport that produced the Invocation. The
+	// policy gate refuses Invocations whose Surface is not enabled
+	// for the resolved leaf.
+	Surface Surface `json:"surface"`
+	// RequestID identifies this one request on its transport: the
+	// X-Request-ID the HTTP middleware issued or echoed, the socket
+	// request's own id. It is per-request; TraceID is the
+	// cross-service correlation a caller propagates.
+	RequestID string `json:"request_id,omitempty"`
+	// TraceID propagates a distributed-trace identifier across
+	// surfaces and sinks (the trace-id field of a W3C traceparent,
+	// or an X-Trace-ID). Empty when the surface did not provide
+	// one.
+	TraceID string `json:"trace_id,omitempty"`
+	// Traceparent is the W3C traceparent of the span this
+	// invocation continues: the caller's, as its transport received
+	// it, or the invocation's own span once a tracing runner
+	// middleware has started one. It is the whole span context
+	// where TraceID is only its correlation id, and
+	// [SubprocessRunner] hands it to the child as TRACEPARENT so a
+	// traced child process joins the same trace. Empty when the
+	// surface received none or received a malformed one.
+	//
+	// It is not part of the serialized Meta: W3C trace context
+	// travels in the transport's own carrier — the traceparent
+	// header on HTTP and Connect, the environment for a child
+	// process — never in a message body, so the published
+	// cmdsurface.v1 schema has no field for it.
+	Traceparent string `json:"-"`
+	// Tracestate is the W3C tracestate that travels with
+	// Traceparent; empty without one. Not serialized, as
+	// Traceparent.
+	Tracestate string `json:"-"`
+	// IdempotencyKey is the caller-supplied key for a replayable
+	// write (the Idempotency-Key header over HTTP). On a remote
+	// surface with [WithIdempotency], the bridge replays the recorded
+	// Result for a key the same principal already used for the same
+	// invocation. It also forwards the key to the leaf's
+	// --idempotency-key flag when the leaf registers one.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	// RequestedAt records when the surface received the request. It
+	// is the audit timestamp: the bridge stamps it at Invoke when a
+	// surface left it zero.
+	RequestedAt time.Time `json:"requested_at,omitempty"`
+	// Extra is a free-form bag for surface-specific context that
+	// downstream sinks may consume (HTTP headers, bus message
+	// headers, FaaS request id).
+	Extra map[string]string `json:"extra,omitempty"`
+}
+
+// Establishment is how a transport established a caller's identity,
+// as recorded in [Meta.Established].
+type Establishment string
+
+const (
+	// EstablishedNone is the zero value: the transport established
+	// nothing. Caller and Tenant, when present, are claims.
+	EstablishedNone Establishment = ""
+	// EstablishedVerified: a verifier the deployment configured
+	// accepted a credential the caller presented (an api.AuthFunc, a
+	// socket Authenticator, a webhook signature, a signed URL, a
+	// consumed OAuth state).
+	EstablishedVerified Establishment = "verified"
+	// EstablishedTransport: the transport proves the caller by
+	// construction, with no credential to check. The socket's
+	// owner-only file admits only the owner's processes; the stdio
+	// peer spawned the process and runs as its user; a platform
+	// invocation (Lambda) was authorized by the platform's IAM; a
+	// cron job was scheduled by the operator.
+	EstablishedTransport Establishment = "transport"
+)
+
+// Authenticated reports whether the transport established the
+// caller's identity: Established is [EstablishedVerified] or
+// [EstablishedTransport]. Any other value, the zero value included,
+// is unauthenticated.
+func (m Meta) Authenticated() bool {
+	return m.Established == EstablishedVerified || m.Established == EstablishedTransport
+}
+
+// Result is the unified return value of a Runner.Run. Surfaces map
+// the fields onto their wire format (REST status, MCP content, RPC
+// response).
+type Result struct {
+	// ExitCode is the process-style exit status. Zero on success.
+	ExitCode int `json:"exit_code"`
+	// Stdout is the captured standard-output text.
+	Stdout string `json:"stdout,omitempty"`
+	// Stderr is the captured standard-error text.
+	Stderr string `json:"stderr,omitempty"`
+	// Data is an optional structured payload the command produced
+	// (when the command writes typed output, e.g. via output.JSON).
+	// Surfaces that prefer typed responses prefer Data over Stdout.
+	Data any `json:"data,omitempty"`
+	// Replayed marks a Result answered from the idempotency ledger
+	// rather than by a run (see [WithIdempotency]). Each transport
+	// renders it as its own replay marker; it is not part of the
+	// serialized Result.
+	Replayed bool `json:"-"`
+}
+
+// Event is one frame of a streaming Runner.Stream call. Kind is
+// the channel; Data carries the line / payload; At is the wall-clock
+// time the event was produced.
+//
+// Reserved Kind values:
+//
+//   - "stdout"  — one line written to stdout
+//   - "stderr"  — one line written to stderr
+//   - "progress" — a structured progress update (Data is payload)
+//   - "done"    — terminal event; Data is *Result (or nil on err)
+type Event struct {
+	Kind string    `json:"kind"`
+	Data any       `json:"data,omitempty"`
+	At   time.Time `json:"at"`
+}
+
+// String returns a single-line representation of inv suitable for
+// log entries. Format:
+//
+//	<surface> <path...> args=[..] flags={..} caller=<id> tenant=<id> request=<id> trace=<id>
+//
+// Flag values are rendered with %v and String does not redact:
+// secrets are the caller's responsibility here. Audit sinks reached
+// through [SinkSet.Emit] receive a redacted copy instead.
+func (inv Invocation) String() string {
+	var b strings.Builder
+	if inv.Meta.Surface != "" {
+		b.WriteString(string(inv.Meta.Surface))
+		b.WriteByte(' ')
+	}
+	if len(inv.Path) == 0 {
+		b.WriteString("(root)")
+	} else {
+		b.WriteString(strings.Join(inv.Path, " "))
+	}
+	if len(inv.Args) > 0 {
+		fmt.Fprintf(&b, " args=%v", inv.Args)
+	}
+	if len(inv.Flags) > 0 {
+		b.WriteString(" flags={")
+		first := true
+		// Stable order: alphabetical by key.
+		keys := sortedKeys(inv.Flags)
+		for _, k := range keys {
+			if !first {
+				b.WriteByte(' ')
+			}
+			fmt.Fprintf(&b, "%s=%v", k, inv.Flags[k])
+			first = false
+		}
+		b.WriteByte('}')
+	}
+	if inv.Meta.Caller != "" {
+		fmt.Fprintf(&b, " caller=%s", inv.Meta.Caller)
+	}
+	if inv.Meta.Tenant != "" {
+		fmt.Fprintf(&b, " tenant=%s", inv.Meta.Tenant)
+	}
+	if inv.Meta.RequestID != "" {
+		fmt.Fprintf(&b, " request=%s", inv.Meta.RequestID)
+	}
+	if inv.Meta.TraceID != "" {
+		fmt.Fprintf(&b, " trace=%s", inv.Meta.TraceID)
+	}
+	return b.String()
+}
+
+// sortedKeys returns the keys of m sorted lexicographically.
+func sortedKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	// Small maps; insertion sort keeps the cost negligible.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1] > out[j]; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
+}

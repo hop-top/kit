@@ -1,0 +1,1001 @@
+package cmdsurface
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"hop.top/kit/go/ai/cmdreflect"
+	"hop.top/kit/go/storage/kv"
+)
+
+// ErrSurfaceNotEnabled is returned when an Invocation's Meta.Surface
+// is not in the resolved leaf's enabled-surface set. Bridge.Expose /
+// Hide / the YAML config control which surfaces a leaf accepts.
+var ErrSurfaceNotEnabled = errors.New("cmdsurface: surface not enabled for command")
+
+// ErrDestructiveBlocked is returned when the policy gate refuses an
+// Invocation because the leaf is destructive and the surface is not
+// in Policy.AllowDestructiveOn.
+var ErrDestructiveBlocked = errors.New("cmdsurface: destructive command blocked on this surface")
+
+// ErrPermissionDenied is returned when the [PermissionFunc] refuses
+// an Invocation. The wrapped message carries the decision's stable
+// reason. Transports map it to their own "forbidden" vocabulary
+// (403 over HTTP, a DENIED wire code on the socket); it is distinct
+// from ErrDestructiveBlocked because the two are answered by
+// different gates and fixed by different people — the destructive
+// ceiling by the deployment's policy, a permission denial by the
+// caller's entitlement.
+var ErrPermissionDenied = errors.New("cmdsurface: permission denied")
+
+// ErrAuthRefused is the one sentinel of the unauthenticated class.
+// The bridge returns it from its authentication gate, when a leaf
+// declaring kit/auth-required is invoked on a remote surface by a
+// caller whose [Meta] carries no established identity (see
+// [Meta.Established]). A transport reports it through [Bridge.Audit]
+// when it refuses a request before the bridge is reached because a
+// presented credential failed verification. Either way the refusal
+// reaches the same sinks: one stream carries "not authenticated",
+// "not permitted", and "ran", with the same provenance fields on
+// each. Transports answer it as their unauthenticated refusal: 401
+// with WWW-Authenticate over HTTP, Unauthenticated over Connect,
+// UNAUTHENTICATED over the socket.
+var ErrAuthRefused = errors.New("cmdsurface: authentication refused")
+
+// idempotencyKeyFlag mirrors the kit-managed --idempotency-key flag
+// name that go/console/cli auto-registers on conditional-idempotent
+// leaves. Mirrored, not imported, for the same reason the annotation
+// keys are: cli reaches this package, not the reverse.
+const idempotencyKeyFlag = "idempotency-key"
+
+// Bridge projects a cobra root onto many surfaces. It owns the
+// Runner, the Policy, and the per-leaf enablement map. Surfaces
+// hand decoded Invocations to Bridge.Invoke and receive Results;
+// they iterate Bridge.Leaves at mount time to discover which
+// commands they should expose.
+//
+// Sinks are the audit fan-out slot. FromConfig populates it from
+// cfg.Telemetry (see config.go) and [WithSinks] adds adopter sinks.
+// Bridge.Invoke emits to registered sinks for every refusal and for
+// every execution on a remote surface (any surface other than
+// SurfaceCLI and SurfaceLib), so a sink sees "refused" and "ran"
+// with the same provenance whether or not the Runner was reached.
+// Adopters wrapping their Runner with the sinkRunner pattern in
+// README.md keep that path; it observes only invocations that reach
+// the Runner, which is why refusals are emitted here.
+type Bridge struct {
+	root   *cobra.Command
+	cfg    bridgeConfig
+	leaves []*Leaf // depth-first leaf order
+	byPath map[string]*Leaf
+	tree   *cmdreflect.Tree
+	sinks  SinkSet
+	// audit is the extra redaction from WithAuditRedaction, nil
+	// when none was given.
+	audit *auditExtra
+	// rcache is the read-tier result cache from WithResultCache, nil
+	// when it is off.
+	rcache *resultCache
+	// capacity is the slot-11 gate from WithConcurrency, nil when it
+	// is off.
+	capacity *capacity
+	mu       sync.RWMutex
+}
+
+// Leaf is the per-command view surface implementations need. Path
+// is the cobra path from root (without the root segment); Cmd is
+// the resolved *cobra.Command; Class is the snapshot of safety
+// annotations; Enabled is the surface allow-set under current
+// configuration.
+type Leaf struct {
+	Path    []string
+	Cmd     *cobra.Command
+	Class   SafetyClass
+	Enabled map[Surface]bool
+
+	// Descriptor is the canonical reflection of this command, from
+	// [hop.top/kit/go/ai/cmdreflect]. Surfaces that need richer
+	// metadata than SafetyClass carries — declared args, flag
+	// types and defaults, output schema, deprecation detail —
+	// read it here instead of walking the cobra tree again.
+	//
+	// Always non-nil for a leaf the bridge discovered.
+	Descriptor *cmdreflect.Descriptor
+
+	// Timeout is the command's [AnnotationTimeout], zero when it
+	// declares none or the annotation does not parse.
+	Timeout time.Duration
+
+	// secretFlags names the flags carrying AnnotationSecretFlag,
+	// resolved once at discovery for the audit redactor.
+	secretFlags map[string]bool
+	// cacheTTL is the leaf's kit/cache-ttl on the read tier, zero
+	// when its results are never cached.
+	cacheTTL time.Duration
+}
+
+// PathKey returns the leaf path as a space-joined string (the form
+// Bridge.Expose / Hide accept as exact match).
+func (l *Leaf) PathKey() string { return strings.Join(l.Path, " ") }
+
+// bridgeConfig is the internal options bag set by Option funcs.
+type bridgeConfig struct {
+	runner     Runner
+	runnerMW   []func(Runner) Runner
+	policy     Policy
+	permission PermissionFunc
+	sinks      SinkSet
+	redaction  AuditRedaction
+	// rateLimit is the slot-7 limiter from WithRateLimit, nil when
+	// the gate is off.
+	rateLimit *rateLimiter
+	// quota is the slot-9 gate from WithQuota, nil when it is off.
+	quota *quotaGate
+	// cache is the slot-8 result cache from WithResultCache, nil when
+	// the cache is off.
+	cache kv.TTLStore
+	// commandTimeout is the deadline of a leaf that declares none.
+	commandTimeout time.Duration
+	// idempotency is replay's configuration, nil when replay is off
+	// (see WithIdempotency).
+	idempotency *idempotencyConfig
+	// concurrency is the slot-11 capacity gate's configuration from
+	// WithConcurrency, nil when the gate is off.
+	concurrency *Concurrency
+	// queueObservers are told of every change to the gate's queue.
+	queueObservers []QueueObserver
+}
+
+// Option configures a Bridge at construction.
+type Option func(*bridgeConfig)
+
+// WithRunner installs r as the bridge's Runner. Default is
+// InProcessRunner(root).
+func WithRunner(r Runner) Option { return func(c *bridgeConfig) { c.runner = r } }
+
+// WithRunnerMiddleware wraps the bridge's Runner, whichever one is
+// in force — the default in-process runner or one set with
+// [WithRunner] — in mw. The first middleware given is the outermost.
+// Repeated options append.
+//
+// A middleware sees exactly the invocations the gates admitted, on
+// both paths that reach a Runner: [Bridge.Invoke] and the streaming
+// surfaces that call [Bridge.Runner] directly. It is the seam for
+// cross-cutting instrumentation (a span per invocation, an in-flight
+// gauge) that must not care which Runner executes the command.
+// Refusals never reach it; observe those through a [Sink].
+func WithRunnerMiddleware(mw ...func(Runner) Runner) Option {
+	return func(c *bridgeConfig) { c.runnerMW = append(c.runnerMW, mw...) }
+}
+
+// WithPolicy installs p as the bridge's Policy. Default is
+// DefaultPolicy().
+func WithPolicy(p Policy) Option { return func(c *bridgeConfig) { c.policy = p } }
+
+// WithPermission installs fn as the bridge's [PermissionFunc], the
+// gate [Invoke] consults after the destructive ceiling and before
+// the Runner on every surface. A nil fn keeps the default,
+// [PermitAll].
+//
+// fn runs after the bridge's built-in scope check, which refuses a
+// remote caller lacking a scope the leaf declares under
+// kit/permissions (see [ErrInsufficientScope]); fn is asked only about
+// calls that check admitted, so it can narrow the answer but never
+// widen it.
+func WithPermission(fn PermissionFunc) Option {
+	return func(c *bridgeConfig) { c.permission = fn }
+}
+
+// WithSinks registers audit sinks on the bridge. [Invoke] emits to
+// them for every refusal and for every execution on a remote
+// surface; [Bridge.Audit] lets a transport report its own pre-flight
+// refusals (failed authentication) through the same set. Repeated
+// options append.
+func WithSinks(specs ...SinkSpec) Option {
+	return func(c *bridgeConfig) { c.sinks = append(c.sinks, specs...) }
+}
+
+// New returns a Bridge that projects root onto the surfaces a
+// caller subsequently enables via Expose / Hide / config. Leaves
+// are discovered once at construction; commands added to root after
+// New is called are not visible to the bridge.
+func New(root *cobra.Command, opts ...Option) *Bridge {
+	cfg := bridgeConfig{policy: DefaultPolicy()}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.runner == nil {
+		cfg.runner = InProcessRunner(root)
+	}
+	// The capacity gate reads the runner's own bound before any
+	// middleware hides it.
+	var capGate *capacity
+	if cfg.concurrency != nil {
+		parallel := 0
+		if pr, ok := cfg.runner.(parallelRunner); ok {
+			parallel = pr.parallelism()
+		}
+		capGate = newCapacity(*cfg.concurrency, parallel, time.Now)
+	}
+	for i := len(cfg.runnerMW) - 1; i >= 0; i-- {
+		if cfg.runnerMW[i] != nil {
+			cfg.runner = cfg.runnerMW[i](cfg.runner)
+		}
+	}
+	if cfg.permission == nil {
+		cfg.permission = PermitAll
+	}
+	b := &Bridge{
+		root:     root,
+		cfg:      cfg,
+		byPath:   make(map[string]*Leaf),
+		sinks:    append(SinkSet(nil), cfg.sinks...),
+		audit:    newAuditExtra(cfg.redaction),
+		rcache:   newResultCache(cfg.cache),
+		capacity: capGate,
+	}
+	b.discover()
+	return b
+}
+
+// discover reflects the cobra tree once and records the leaves the
+// bridge will project, in depth-first order.
+//
+// Reflection is delegated to [hop.top/kit/go/ai/cmdreflect], which
+// describes EVERY command and records a reason for each one it
+// judges non-invocable. The bridge keeps the invocable ones as
+// leaves; the reasons for the rest stay available through
+// [Bridge.NonInvocable], so "this command is not on the bridge"
+// has an answer instead of being a silent omission.
+//
+// Hidden and deprecated commands are excluded, which is the
+// reflector's default. Expose can re-enable a leaf by exact path,
+// but only among the ones discovered here — matching the behavior
+// this method has always had.
+func (b *Bridge) discover() {
+	defaults := b.cfg.policy.resolvedDefaults()
+	defaultSet := make(map[Surface]bool, len(defaults))
+	for _, s := range defaults {
+		defaultSet[s] = true
+	}
+
+	// Interactive and destructive commands stay discoverable: the
+	// bridge gates them at Invoke time through Policy.Allowed,
+	// which is a per-surface decision the reflector cannot make
+	// for all surfaces at once.
+	b.tree = cmdreflect.Reflect(
+		b.root,
+		cmdreflect.AllowInteractive(),
+		cmdreflect.AllowReserved(),
+	)
+
+	for _, d := range b.tree.Invocable() {
+		if d.IsRoot() || d.Surface.HasSubCommands {
+			continue
+		}
+		enabled := make(map[Surface]bool, len(defaultSet))
+		for k, v := range defaultSet {
+			enabled[k] = v
+		}
+		timeout, _ := CommandTimeout(d.Cmd)
+		leaf := &Leaf{
+			Path:       append([]string(nil), d.Path[1:]...),
+			Cmd:        d.Cmd,
+			Class:      classFromDescriptor(d),
+			Enabled:    enabled,
+			Descriptor: d,
+			Timeout:    timeout,
+
+			secretFlags: secretFlagSet(d.Cmd),
+			cacheTTL:    cacheTTLOf(d),
+		}
+		b.leaves = append(b.leaves, leaf)
+		b.byPath[leaf.PathKey()] = leaf
+	}
+}
+
+// NonInvocable returns the descriptors the bridge did NOT turn into
+// leaves, each carrying the reason it was excluded. Capability
+// endpoints that advertise "every command" render these alongside
+// Leaves so an agent can tell "no such command" from "that command
+// exists but is not reachable here".
+func (b *Bridge) NonInvocable() []*cmdreflect.Descriptor {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.tree == nil {
+		return nil
+	}
+	return b.tree.NonInvocable()
+}
+
+// Descriptors returns the complete reflection of the bridge's cobra
+// tree, invocable commands and excluded ones alike.
+func (b *Bridge) Descriptors() []*cmdreflect.Descriptor {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.tree == nil {
+		return nil
+	}
+	return b.tree.Descriptors
+}
+
+// Leaves returns the bridge's leaves in depth-first discovery
+// order. The returned slice is a read-only view; surfaces must not
+// mutate the Enabled maps (use Expose/Hide instead).
+func (b *Bridge) Leaves() []*Leaf {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]*Leaf, len(b.leaves))
+	copy(out, b.leaves)
+	return out
+}
+
+// Expose enables surfaces on every leaf whose path matches pattern.
+// Pattern forms:
+//
+//   - "widget add"  — exact path
+//   - "widget *"    — every leaf under "widget"
+//   - "*"           — every leaf
+//
+// When surfaces is empty Expose is a no-op. Returns the receiver
+// for chaining.
+func (b *Bridge) Expose(pattern string, surfaces ...Surface) *Bridge {
+	return b.setSurfaces(pattern, surfaces, true)
+}
+
+// Hide disables surfaces on every leaf matching pattern. See
+// Expose for pattern forms.
+func (b *Bridge) Hide(pattern string, surfaces ...Surface) *Bridge {
+	return b.setSurfaces(pattern, surfaces, false)
+}
+
+func (b *Bridge) setSurfaces(pattern string, surfaces []Surface, value bool) *Bridge {
+	if len(surfaces) == 0 {
+		return b
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, leaf := range b.leaves {
+		if !matchPattern(pattern, leaf.Path) {
+			continue
+		}
+		for _, s := range surfaces {
+			leaf.Enabled[s] = value
+		}
+	}
+	return b
+}
+
+// matchPattern reports whether path matches pattern. Patterns are
+// space-separated segments; the final segment may be "*" to match
+// any descendant, and a single "*" matches every leaf.
+func matchPattern(pattern string, path []string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return false
+	}
+	if pattern == "*" {
+		return true
+	}
+	pat := strings.Fields(pattern)
+	if len(pat) == 0 {
+		return false
+	}
+	// Wildcard tail: "a b *" matches any path with prefix [a,b].
+	if pat[len(pat)-1] == "*" {
+		prefix := pat[:len(pat)-1]
+		if len(path) < len(prefix) {
+			return false
+		}
+		for i, seg := range prefix {
+			if path[i] != seg {
+				return false
+			}
+		}
+		return true
+	}
+	// Exact match.
+	if len(pat) != len(path) {
+		return false
+	}
+	for i, seg := range pat {
+		if path[i] != seg {
+			return false
+		}
+	}
+	return true
+}
+
+// Invoke routes inv through the bridge: resolves the leaf, applies
+// the gates in order, then delegates to the configured Runner. The
+// gates, and the error each refusal returns:
+//
+//  1. Resolution — ErrUnknownCommand: inv.Path does not resolve.
+//  2. Enablement — ErrSurfaceNotEnabled: leaf is not exposed on
+//     inv.Meta.Surface.
+//  3. Invocability — ErrNotInvocable: the leaf is interactive or
+//     self-hosting and can never run through a transport; the
+//     message carries the reflector's reason.
+//  4. Authentication required — ErrAuthRefused: the leaf declares
+//     kit/auth-required, the surface is remote, and Meta carries no
+//     identity the transport established ([Meta.Authenticated]). A
+//     claimed Caller does not count; the CLI and in-process library
+//     surfaces are the operator's own and pass.
+//  5. Destructive ceiling — ErrDestructiveBlocked: leaf is
+//     destructive and Policy disallows the surface.
+//  6. Permission — first the built-in scope check, then the
+//     [PermissionFunc]. ErrInsufficientScope, as an
+//     [*InsufficientScopeError]: the leaf declares kit/permissions,
+//     the surface is remote, and the caller's verified credential
+//     lacks one of those scopes (a transport-established caller holds
+//     the owner's authority and passes; an unestablished one holds
+//     none). Then ErrPermissionDenied: the [PermissionFunc] refused
+//     this Meta for this leaf; the message carries its reason.
+//  7. Rate limit — ErrRateLimited, as a [*RateLimitedError] carrying
+//     the retry hint: the caller's bucket for the leaf's tier is
+//     empty. Only with [WithRateLimit], and only on remote surfaces.
+//  8. Replay — with [WithIdempotency], on a remote surface, a call
+//     whose key names a call still running is refused with
+//     ErrIdempotencyConflict, and a key used for another invocation
+//     with ErrIdempotencyKeyReused; a key already used for this
+//     invocation answers with the recorded Result and runs nothing.
+//
+// A read leaf declaring kit/cache-ttl that no replay answered may then
+// be answered from the result cache without running (see
+// [WithResultCache]). Otherwise:
+//
+//  9. Quota — ErrQuotaExceeded (wrapping ErrRateLimited), as a
+//     [*QuotaExceededError] carrying the window's reset: the caller
+//     has used its calls or bytes for the window. Only with
+//     [WithQuota], and only on remote surfaces; a successful run is
+//     counted against it afterwards.
+//
+// A call that runs then takes an in-flight slot, or waits for one in a
+// bounded queue: ErrOverloaded, as an [*OverloadedError] carrying a
+// retry hint, when both are full. Only with [WithConcurrency], and only
+// on remote surfaces. A replay or a cache hit runs nothing: it spends
+// no quota and takes no slot.
+//
+// Confirmation is deliberately not a gate here: it is the command's
+// own flag and its own refusal, the same on every surface as on the
+// CLI, so the Runner's Result carries it as an exit code.
+//
+// Every refusal, and every execution on a remote surface, is emitted
+// to the bridge's sinks (see [WithSinks]) with the Meta the transport
+// supplied. RequestedAt is stamped when the surface left it zero, so
+// an audit record always has a timestamp. When Meta carries an
+// IdempotencyKey and the leaf registers the kit-managed
+// --idempotency-key flag, the key is forwarded as that flag unless
+// the caller set it explicitly.
+//
+// The Runner's own errors are returned as-is (wrapped runners are
+// responsible for their own error contracts).
+//
+// Invoke is [Bridge.Admit] followed by a run. A transport that
+// streams uses the two halves separately: Admit, then
+// [Admission.Stream].
+func (b *Bridge) Invoke(ctx context.Context, inv Invocation) (Result, error) {
+	adm, err := b.Admit(ctx, inv)
+	if err != nil {
+		return Result{}, err
+	}
+	return adm.Run(ctx)
+}
+
+// Admission is an invocation every gate of [Bridge.Invoke] has
+// admitted and that has not run yet. It exists so a streaming
+// transport can answer a refusal before it commits to a stream — an
+// HTTP status rather than an error frame inside a 200, say — and
+// still run the command under exactly the gates, audit and
+// idempotency forwarding Invoke applies.
+//
+// An Admission runs at most once.
+type Admission struct {
+	b    *Bridge
+	inv  Invocation
+	leaf *Leaf
+	// cache is the result cache's part of the call, nil when the
+	// cache has nothing to do with it.
+	cache *cacheCall
+	// idem is slot 8's idempotency verdict: a replay, a reserved
+	// key, or nil.
+	idem *idemClaim
+	// ticket is the call's place at the capacity gate, nil until it
+	// takes one; inQueue reports that it is counted as queued.
+	ticket  *capTicket
+	inQueue bool
+	// refused is the capacity gate's refusal from Reserve: the call
+	// never runs.
+	refused error
+	// quotaKey is the ledger key slot 13 counts the run under, empty
+	// when no quota applies.
+	quotaKey string
+}
+
+// Admit applies the gates [Bridge.Invoke] applies, in the same order
+// and with the same errors, without running anything. A refusal is
+// audited exactly as Invoke audits it and returned with a nil
+// Admission. On success the Admission carries the normalized
+// invocation: Surface defaulted, RequestedAt stamped, the idempotency
+// key forwarded, and — for a read the result cache handles — the
+// cache lookup's outcome, which Run answers without running on a hit.
+//
+// Admission alone emits nothing to the sinks: the record for an
+// admitted invocation is written when it runs, carrying its outcome.
+func (b *Bridge) Admit(ctx context.Context, inv Invocation) (*Admission, error) {
+	if inv.Meta.Surface == "" {
+		// Library callers may omit the field; treat as SurfaceLib so
+		// in-process Invoke calls Just Work.
+		inv.Meta.Surface = SurfaceLib
+	}
+	if inv.Meta.RequestedAt.IsZero() {
+		inv.Meta.RequestedAt = time.Now()
+	}
+	surface := inv.Meta.Surface
+
+	leaf, err := b.resolveLeaf(inv.Path)
+	ctx = b.auditContext(ctx, leaf)
+	if err == nil {
+		err = b.callerIndependentGates(inv, leaf)
+	}
+	if err != nil {
+		return nil, b.refuse(ctx, inv, err)
+	}
+	// Slot 6, the permission gate: the built-in scope check
+	// (scope.go), then the configured PermissionFunc. Each can only
+	// narrow.
+	if err := scopeCheck(inv.Meta, leaf); err != nil {
+		return nil, b.refuse(ctx, inv, err)
+	}
+	if dec := b.Permission(withInvocation(ctx, inv), inv.Meta, leaf); !dec.Allowed {
+		return nil, b.refuse(ctx, inv, fmt.Errorf("%w: %s on %s: %s",
+			ErrPermissionDenied, leaf.PathKey(), surface, dec.Reason))
+	}
+	// Slot 7: rate limit (ratelimit.go). Only a call policy admits
+	// spends a token.
+	if err := b.rateLimit(inv, leaf); err != nil {
+		return nil, b.refuse(ctx, inv, err)
+	}
+	// A runner holding no tree (a subprocess) learns from the
+	// invocation whether the leaf parses its own argv.
+	inv.ownArgv = leaf.Cmd != nil && leaf.Cmd.DisableFlagParsing
+	// Slot 8, replay: idempotency first, then the read-tier result
+	// cache. A replay or a cache hit is answered by Run without
+	// running.
+	idem, err := b.admitIdempotency(ctx, inv)
+	if err != nil {
+		return nil, b.refuse(ctx, inv, err)
+	}
+	if idem != nil && idem.replay != nil {
+		inv = markReplayed(inv)
+	}
+	adm := &Admission{b: b, inv: forwardIdempotencyKey(inv, leaf), leaf: leaf, idem: idem}
+	if idem == nil || idem.replay == nil {
+		adm.cache = b.cacheLookup(ctx, inv, leaf)
+		// Slot 9: quota (quota.go). A replay or a cache hit runs
+		// nothing and spends none.
+		if adm.cache == nil || adm.cache.hit == nil {
+			if err := b.quotaCheck(ctx, adm); err != nil {
+				// The call never runs: free its idempotency key now.
+				adm.idem.abandon()
+				return nil, b.refuse(ctx, inv, err)
+			}
+		}
+	}
+	return adm, nil
+}
+
+// callerIndependentGates is slots 2–5 for a resolved leaf: surface
+// enablement, invocability, authentication required, the destructive
+// ceiling. It returns the refusal, unaudited, or nil.
+func (b *Bridge) callerIndependentGates(inv Invocation, leaf *Leaf) error {
+	surface := inv.Meta.Surface
+	if !leaf.Enabled[surface] {
+		return fmt.Errorf("%w: %s on %s", ErrSurfaceNotEnabled, leaf.PathKey(), surface)
+	}
+	if reason := notInvocableReason(leaf); reason != cmdreflect.ReasonNone {
+		return fmt.Errorf("%w: %s on %s is %s (%s)",
+			ErrNotInvocable, leaf.PathKey(), surface, reason, reason.Explain())
+	}
+	if leaf.Class.AuthRequired && surface.remote() && !inv.Meta.Authenticated() {
+		return fmt.Errorf("%w: %s on %s requires an authenticated caller",
+			ErrAuthRefused, leaf.PathKey(), surface)
+	}
+	if !b.cfg.policy.Allowed(leaf.Class, surface) {
+		return fmt.Errorf("%w: %s on %s", ErrDestructiveBlocked, leaf.PathKey(), surface)
+	}
+	return nil
+}
+
+// ScopeRefusal answers the built-in scope check — slot 6's first
+// decider — for inv ahead of Admit, for a transport that must answer
+// a scope refusal in its own HTTP response while a protocol stack
+// beneath it answers everything else in the protocol's envelope: the
+// MCP HTTP surfaces answer it 403 with the RFC 6750 challenge before
+// the MCP SDK reads the call.
+//
+// It returns nil when the scope check admits the call, and when an
+// earlier slot (1–5) would refuse it: that call meets every gate, in
+// order, where the transport runs it. Otherwise it audits the refusal
+// as Admit does and returns it — an [*InsufficientScopeError] wrapping
+// [ErrInsufficientScope], naming the scopes. It runs, charges and
+// counts nothing, and asks no [PermissionFunc].
+func (b *Bridge) ScopeRefusal(ctx context.Context, inv Invocation) error {
+	if inv.Meta.Surface == "" {
+		inv.Meta.Surface = SurfaceLib
+	}
+	if inv.Meta.RequestedAt.IsZero() {
+		inv.Meta.RequestedAt = time.Now()
+	}
+	leaf, err := b.resolveLeaf(inv.Path)
+	if err != nil || b.callerIndependentGates(inv, leaf) != nil {
+		return nil
+	}
+	if err := scopeCheck(inv.Meta, leaf); err != nil {
+		return b.refuse(b.auditContext(ctx, leaf), inv, err)
+	}
+	return nil
+}
+
+// Replayed reports whether the admission is an idempotency replay: it
+// answers with a recorded Result and runs nothing. A surface that
+// asks a person for confirmation between Admit and the run does not
+// ask for a replay.
+func (a *Admission) Replayed() bool {
+	_, ok := a.idem.replayed()
+	return ok
+}
+
+// Abandon releases what admission reserved for a run that will not
+// happen — the idempotency key of a call a person declined. The
+// request context ending does the same; Abandon frees the key sooner.
+// An abandoned Admission must not be run.
+func (a *Admission) Abandon() { a.idem.abandon() }
+
+// Invocation returns the admitted invocation as it will run.
+func (a *Admission) Invocation() Invocation { return a.inv }
+
+// Run runs the admitted invocation through the Runner's Run and
+// returns its Result. On a remote surface the outcome is audited once,
+// after the run. Invoke is Admit followed by Run.
+//
+// An idempotency replay returns the recorded Result, marked Replayed,
+// and runs nothing; a run that succeeds under a key is recorded.
+//
+// The per-command deadline ([AnnotationTimeout], else
+// [WithCommandTimeout]) is armed here and bounds the run; a run the
+// deadline cut short returns [ErrDeadlineExceeded] with its partial
+// Result. The capacity gate ([WithConcurrency]) is taken under it, so
+// time spent queued counts against the deadline.
+//
+// Holding the Admission between the two is what lets a transport put
+// something only a person can supply — a confirmation — after every
+// machine gate and before the run, without asking about a call the
+// gates would refuse and without answering the gates twice.
+func (a *Admission) Run(ctx context.Context) (Result, error) {
+	if a.refused != nil {
+		return Result{}, a.refused
+	}
+	defer a.dropPlace(ctx)
+	if res, ok := a.idem.replayed(); ok {
+		ctx = a.b.auditContext(ctx, a.leaf)
+		if a.inv.Meta.Surface.remote() {
+			a.b.Audit(ctx, a.inv, res, nil)
+		}
+		return res, nil
+	}
+	if a.cache != nil {
+		res, err := a.runCached(ctx)
+		// Slot 13: a keyed read the cache answered or ran is recorded
+		// like any run, and its reservation released.
+		a.idem.settle(ctx, res, err)
+		return res, err
+	}
+	// Stamped before the run, so a Runner emitting to its own SinkSet
+	// redacts the leaf's secret flags as the bridge's sinks do.
+	ctx = a.b.auditContext(ctx, a.leaf)
+	res, err := a.runBounded(ctx)
+	// Slot 13: a successful run is recorded under its key.
+	a.idem.settle(ctx, res, err)
+	if a.inv.Meta.Surface.remote() {
+		a.b.Audit(ctx, a.inv, res, err)
+	}
+	return res, err
+}
+
+// Stream runs the admitted invocation through the Runner's Stream and
+// forwards every Event to out, the terminal "done" Event included.
+// It closes out when the run ends, as a Runner does, so the caller
+// must keep receiving until then.
+//
+// On a remote surface the outcome is audited once, after the run:
+// the Result is the one the done Event carried, and the error is the
+// Runner's — a cancellation when ctx ended the run, which is how a
+// client that disconnected mid-stream appears in the audit trail.
+//
+// An idempotency replay streams the recorded Result as a run would —
+// one Event per output line, then the done Event — and runs nothing.
+//
+// A result cache hit is answered as a single done Event carrying the
+// stored Result, and nothing runs. A miss streams as usual and stores
+// nothing: only Run fills the cache.
+//
+// The per-command deadline and the capacity gate are taken as in
+// [Admission.Run]; a stream the deadline cuts short still delivers
+// its done Event and then returns [ErrDeadlineExceeded]. A call the
+// gate refuses, or whose deadline passes while it waits, sends no
+// Event: out is closed and the error returned. A streaming transport
+// that must answer an overload before it commits calls
+// [Admission.Reserve] first.
+func (a *Admission) Stream(ctx context.Context, out chan<- Event) error {
+	if out == nil {
+		return errors.New("cmdsurface: nil event channel")
+	}
+	if a.refused != nil {
+		close(out)
+		return a.refused
+	}
+	defer a.dropPlace(ctx)
+	if res, ok := a.idem.replayed(); ok {
+		ctx = a.b.auditContext(ctx, a.leaf)
+		replayEvents(res, out)
+		close(out)
+		if a.inv.Meta.Surface.remote() {
+			a.b.Audit(ctx, a.inv, res, nil)
+		}
+		return nil
+	}
+	if a.cache != nil && a.cache.hit != nil {
+		err := a.streamHit(ctx, out)
+		a.idem.settle(ctx, a.cache.hit.Result, err)
+		return err
+	}
+	ctx = a.b.auditContext(ctx, a.leaf)
+	runCtx, cancel, bound := a.b.armDeadline(withAdmitted(ctx, a.inv.Meta), a.leaf)
+	defer cancel()
+	release, qerr := a.acquire(runCtx)
+	if qerr != nil {
+		qerr = queueDeadlineError(runCtx, qerr, a.leaf, bound)
+		close(out)
+		if a.inv.Meta.Surface.remote() {
+			a.b.Audit(ctx, a.inv, Result{}, qerr)
+		}
+		return qerr
+	}
+	defer release()
+	events := make(chan Event, cap(out))
+	errc := make(chan error, 1)
+	go func() { errc <- a.b.cfg.runner.Stream(runCtx, a.inv, events) }()
+
+	var res Result
+	// The Runner contract closes events when the run ends.
+	for ev := range events {
+		if ev.Kind == "done" {
+			if r, ok := ev.Data.(*Result); ok && r != nil {
+				res = *r
+			}
+		}
+		out <- ev
+	}
+	err := deadlineError(runCtx, <-errc, a.leaf, bound)
+	// Slot 13: the done Event carries the Result Run would have
+	// returned, so a successful stream is recorded as a run is.
+	a.idem.settle(ctx, res, err)
+	close(out)
+	if err == nil {
+		a.recordQuota(ctx, resultBytes(res))
+	}
+	if a.inv.Meta.Surface.remote() {
+		a.b.Audit(ctx, a.inv, res, err)
+	}
+	return err
+}
+
+// refuse emits a pre-execution refusal to the sinks when the surface
+// is remote and returns err unchanged, so every early return in
+// Invoke reads the same.
+func (b *Bridge) refuse(ctx context.Context, inv Invocation, err error) error {
+	if inv.Meta.Surface.remote() {
+		b.Audit(ctx, inv, Result{}, err)
+	}
+	return err
+}
+
+// forwardIdempotencyKey copies Meta.IdempotencyKey into the leaf's
+// --idempotency-key flag when the leaf has one and the caller did not
+// set it. The caller's Flags map is never mutated: a transport may
+// reuse it.
+func forwardIdempotencyKey(inv Invocation, leaf *Leaf) Invocation {
+	if inv.Meta.IdempotencyKey == "" || leaf == nil || leaf.Cmd == nil {
+		return inv
+	}
+	if leaf.Cmd.Flags().Lookup(idempotencyKeyFlag) == nil {
+		return inv
+	}
+	if _, set := inv.Flags[idempotencyKeyFlag]; set {
+		return inv
+	}
+	flags := make(map[string]any, len(inv.Flags)+1)
+	for k, v := range inv.Flags {
+		flags[k] = v
+	}
+	flags[idempotencyKeyFlag] = inv.Meta.IdempotencyKey
+	inv.Flags = flags
+	return inv
+}
+
+// invocationKey is the context key of the invocation the permission
+// gate is deciding.
+type invocationKey struct{}
+
+// withInvocation returns ctx carrying inv for the [PermissionFunc].
+func withInvocation(ctx context.Context, inv Invocation) context.Context {
+	return context.WithValue(ctx, invocationKey{}, inv)
+}
+
+// InvocationFromContext returns the invocation a [PermissionFunc] is
+// asked about: its positional Args and parsed Flags, beside the Meta
+// and Leaf the function receives as arguments. [Bridge.Admit] puts it
+// on the context it hands the permission gate, so a decision can read
+// what the caller asked for, not only who asked.
+//
+// It reports false when no invocation is being decided — a surface
+// consulting [Bridge.Permission] at mount time, before any caller
+// exists. The Flags map is the transport's; read it, never write it.
+func InvocationFromContext(ctx context.Context) (Invocation, bool) {
+	if ctx == nil {
+		return Invocation{}, false
+	}
+	inv, ok := ctx.Value(invocationKey{}).(Invocation)
+	return inv, ok
+}
+
+// Permission asks the bridge's [PermissionFunc] whether meta may
+// invoke leaf. Surfaces consult it at mount time with a Meta that
+// carries only the surface, and honor a refusal there only when the
+// decision is CallerIndependent — a caller-specific verdict cannot
+// be known before a caller exists. At mount time the context carries
+// no invocation ([InvocationFromContext] reports false). A listing
+// made for a caller the transport established asks [Bridge.Verdict]
+// instead.
+func (b *Bridge) Permission(ctx context.Context, meta Meta, leaf *Leaf) PermissionDecision {
+	if leaf == nil {
+		return PermissionDecision{Allowed: true}
+	}
+	return b.cfg.permission(ctx, meta, leaf)
+}
+
+// Audit emits one record to the bridge's registered sinks. Invoke
+// calls it for every refusal and every remote execution; a transport
+// calls it directly for a refusal the bridge never sees — a failed
+// authentication, reported with [ErrAuthRefused] — so one audit
+// stream carries every verdict with the same provenance fields.
+//
+// Sinks are best-effort: their errors are dropped here, as the
+// SinkSet contract already makes them non-fatal, and an audit sink
+// must never turn a refusal into a different refusal.
+//
+// Sinks receive a redacted copy (see [SinkSet.Emit]); the flags of
+// the leaf inv.Path names that carry [AnnotationSecretFlag] are
+// masked with the rest.
+func (b *Bridge) Audit(ctx context.Context, inv Invocation, res Result, err error) {
+	sinks := b.Sinks()
+	if len(sinks) == 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, stamped := ctx.Value(auditScopeKey{}).(auditScope); !stamped {
+		leaf, _ := b.resolveLeaf(inv.Path)
+		ctx = b.auditContext(ctx, leaf)
+	}
+	_ = sinks.Emit(ctx, inv, res, err)
+}
+
+// remote reports whether s is a surface other than the two local
+// runtimes. Audit applies to remote surfaces: a CLI invocation is
+// the operator's own act, and an in-process library call has no
+// caller to attribute.
+func (s Surface) remote() bool {
+	return s != SurfaceCLI && s != SurfaceLib
+}
+
+// resolveLeaf returns the *Leaf for path, or ErrUnknownCommand.
+func (b *Bridge) resolveLeaf(path []string) (*Leaf, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	key := strings.Join(path, " ")
+	if leaf, ok := b.byPath[key]; ok {
+		return leaf, nil
+	}
+	return nil, fmt.Errorf("%w: %s", ErrUnknownCommand, joinPath(path))
+}
+
+// Runner exposes the configured Runner, for callers that wrap or
+// inspect it. Calling its Run or Stream directly skips every gate and
+// the audit: a surface that streams admits the invocation with
+// [Bridge.Admit] and runs it with [Admission.Stream].
+func (b *Bridge) Runner() Runner {
+	return b.cfg.runner
+}
+
+// Policy returns the active Policy. Surfaces consult it to render
+// "would this leaf be allowed?" lists in capability endpoints.
+func (b *Bridge) Policy() Policy { return b.cfg.policy }
+
+// Sinks returns a copy of the bridge's registered SinkSet. The
+// returned slice is safe to inspect and to pass to SinkSet.Emit;
+// mutating it does not affect the bridge.
+//
+// FromConfig populates it with the telemetry sink and [WithSinks]
+// adds adopter sinks. Callers wiring a sinkRunner can merge
+// Bridge.Sinks() with their own specs.
+func (b *Bridge) Sinks() SinkSet {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make(SinkSet, len(b.sinks))
+	copy(out, b.sinks)
+	return out
+}
+
+// appendSink registers spec on the bridge. Internal helper for
+// FromConfig and (potentially) future Expose-style sink builders.
+// Not exported: the public Bridge surface is fluent and we don't
+// want adopters constructing partial SinkSpecs by accident — the
+// sinkRunner pattern stays the recommended path for adopter sinks.
+func (b *Bridge) appendSink(spec SinkSpec) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sinks = append(b.sinks, spec)
+}
+
+// closableSink is the duck-typed close contract registered sinks
+// may implement. TelemetrySink satisfies it; non-closable sinks
+// (LogSink, FileSink, …) silently no-op during Bridge.Close. This
+// is the minimum surface needed to flush the kit-telemetry drain
+// goroutine on process shutdown.
+type closableSink interface {
+	Close(context.Context) error
+}
+
+// Close drains every registered sink that implements
+// closableSink. Errors are collected and joined; the first
+// returned error does not short-circuit the rest. Idempotent only
+// to the extent each sink's own Close is idempotent —
+// TelemetrySink.Close is.
+//
+// Bridge.Close does NOT close the cobra root or the Runner;
+// adopters that own additional resources (HTTP servers, bus
+// subscribers) close those separately. The single responsibility
+// here is "flush the drain goroutines my sinks own".
+func (b *Bridge) Close(ctx context.Context) error {
+	b.mu.RLock()
+	specs := make(SinkSet, len(b.sinks))
+	copy(specs, b.sinks)
+	b.mu.RUnlock()
+
+	var errs []error
+	for _, spec := range specs {
+		if spec.Sink == nil {
+			continue
+		}
+		c, ok := spec.Sink.(closableSink)
+		if !ok {
+			continue
+		}
+		if err := c.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
+}
