@@ -1,0 +1,494 @@
+package mcpsdk
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"sync"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"hop.top/kit/go/transport/api"
+	"hop.top/kit/go/transport/cmdsurface"
+)
+
+// Default identity for the MCP server, mirroring the hand-rolled
+// surface's defaults so adopters switching implementations see a
+// familiar shape.
+const (
+	defaultServerName    = "mcpsdk"
+	defaultServerVersion = "0.0.0"
+	defaultPath          = "/mcp"
+)
+
+// config is the internal options bag set by Option funcs.
+type config struct {
+	path          string
+	serverName    string
+	serverVersion string
+	instructions  string
+	stateless     bool
+	jsonResponse  bool
+	serverOptions *mcp.ServerOptions
+	configurators []func(*mcp.Server)
+	toolDecorator func(*cmdsurface.Leaf, *mcp.Tool)
+	tasks         *TasksConfig
+	callMeta      func(context.Context, *mcp.CallToolRequest) cmdsurface.Meta
+	authenticated func(context.Context, *mcp.CallToolRequest) bool
+	elicitConfirm bool
+	elicitKey     []byte
+	maxBody       int64
+	// noLocalhostProtection backs WithoutLocalhostProtection.
+	noLocalhostProtection bool
+	// origins backs WithOriginAllowlist; originCheck records that
+	// the option was given at all.
+	origins     []string
+	originCheck bool
+	// protected, protectAuth back WithProtectedResource; protectSet
+	// records that the option was given at all.
+	protected   *api.ProtectedResource
+	protectAuth api.AuthFunc
+	protectSet  bool
+}
+
+// Option configures the surface built by NewServer / Handler / Mount.
+type Option func(*config)
+
+// WithPath overrides the default mount path ("/mcp"). Only Mount
+// consults it; Handler returns a path-agnostic http.Handler.
+func WithPath(path string) Option {
+	return func(c *config) { c.path = path }
+}
+
+// WithServerInfo sets the server identity advertised during
+// initialization. Defaults: name="mcpsdk", version="0.0.0".
+func WithServerInfo(name, version string) Option {
+	return func(c *config) {
+		c.serverName = name
+		c.serverVersion = version
+	}
+}
+
+// WithInstructions sets the optional instructions string offered to
+// connecting clients during initialization.
+func WithInstructions(text string) Option {
+	return func(c *config) { c.instructions = text }
+}
+
+// WithStateless serves the streamable HTTP transport in stateless
+// mode only: no Mcp-Session-Id header, a temporary session per
+// request, and GET/DELETE rejected with 405 — for every protocol
+// revision, so a client on a revision before 2026-07-28 gets no
+// server-to-client requests. Suitable for serverless and
+// load-balanced deployments where session affinity is unavailable.
+// Without it, Handler keeps sessions for those revisions and serves
+// 2026-07-28 statelessly on the same endpoint.
+func WithStateless() Option {
+	return func(c *config) { c.stateless = true }
+}
+
+// WithMaxBodyBytes caps each HTTP request body at n bytes through
+// the SDK's own StreamableHTTPOptions.MaxRequestBodyBytes. Zero keeps
+// kit's default, api.DefaultMaxBodyBytes (1 MiB, tighter than the
+// SDK's 4 MiB); a negative n disables the cap. The SDK refuses an
+// oversized body with HTTP 413 and a plain-text reason, for
+// Content-Length, chunked and HTTP/2 bodies alike.
+func WithMaxBodyBytes(n int64) Option {
+	return func(c *config) { c.maxBody = n }
+}
+
+// WithoutLocalhostProtection turns off the SDK's DNS-rebinding check,
+// which refuses a request arriving on a loopback connection whose Host
+// is not a loopback name, with 403 and a plain-text reason. Give it
+// only when the listener in front runs a Host check of its own and
+// that check admits other names — kit's services.<svc>.host_check
+// with an allow list, or switched off by the operator — so the SDK's
+// narrower check would refuse what the listener's configuration
+// allows. Without it the SDK's check stays in force beneath any
+// listener.
+func WithoutLocalhostProtection() Option {
+	return func(c *config) { c.noLocalhostProtection = true }
+}
+
+// WithJSONResponse makes streamable HTTP responses use
+// application/json bodies instead of text/event-stream.
+func WithJSONResponse() Option {
+	return func(c *config) { c.jsonResponse = true }
+}
+
+// WithServerOptions supplies the base *mcp.ServerOptions passed to
+// the SDK verbatim — the full pass-through for everything this
+// package does not manage itself: PageSize, SubscribeHandler /
+// UnsubscribeHandler, CompletionHandler, Capabilities, KeepAlive,
+// GetSessionID, and so on. A shallow copy is taken, and
+// WithInstructions (when given) overrides the copy's Instructions
+// field; every other field reaches mcp.NewServer untouched.
+func WithServerOptions(o *mcp.ServerOptions) Option {
+	return func(c *config) { c.serverOptions = o }
+}
+
+// WithServerConfigurator registers fn to run against the built
+// *mcp.Server after kit's tools are bound. This is the adopter
+// hook for the rest of the SDK's feature surface — AddPrompt,
+// AddResource, AddResourceTemplate, custom methods — using the
+// SDK's own APIs directly; kit wraps none of them. Capability
+// advertisement follows automatically from what fn registers (SDK
+// behavior). Repeatable; configurators run in registration order.
+func WithServerConfigurator(fn func(*mcp.Server)) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.configurators = append(c.configurators, fn)
+		}
+	}
+}
+
+// WithToolDecorator registers fn to enrich each bound tool's
+// descriptor before registration: title, annotations, output
+// schema, icons — any optional mcp.Tool field. fn runs after kit
+// populates the defaults (name, description, input schema,
+// destructive hint) and may override them. Note kit cannot derive
+// an outputSchema mechanically: bridge Results carry untyped Data,
+// so output schemas are adopter knowledge and belong here.
+func WithToolDecorator(fn func(*cmdsurface.Leaf, *mcp.Tool)) Option {
+	return func(c *config) { c.toolDecorator = fn }
+}
+
+// WithOriginAllowlist validates the Origin header in front of the
+// SDK handler — the option cmdsurface.MountMCP spells
+// WithMCPOriginAllowlist. origins, each "scheme://host[:port]", are
+// the cross-origin browser pages permitted to call; none at all
+// permits same-origin only.
+//
+// A request with no Origin (a non-browser client) or a same-origin
+// one passes; a POST or DELETE from any other origin is refused with
+// 403 and a JSON-RPC error body (id null) whose message starts with
+// [api.CodeOriginRejected]. The check is [api.OriginCheck]. A GET
+// needs no check: it carries Mcp-Session-Id, which a cross-origin
+// page cannot send without a CORS preflight the handler never
+// grants.
+//
+// It is opt-in because the listener in front usually owns the check:
+// kit's api service validates Host and Origin for every route it
+// serves, a mount on its router included, and a second check here
+// with a different allowlist would refuse what the service's
+// configuration permits. Give it when serving Handler on a listener
+// of your own. New returns an error for an entry that is not a bare
+// origin.
+func WithOriginAllowlist(origins ...string) Option {
+	return func(c *config) {
+		c.originCheck = true
+		c.origins = append(c.origins, origins...)
+	}
+}
+
+func newConfig(opts ...Option) config {
+	cfg := config{
+		path:          defaultPath,
+		serverName:    defaultServerName,
+		serverVersion: defaultServerVersion,
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
+}
+
+// Surface is a live binding between a bridge and an *mcp.Server. It
+// tracks which leaves are currently registered as tools so that
+// runtime enablement changes (Hide / Expose / Sync) translate into
+// SDK tool add/remove calls, which in turn make connected sessions
+// receive tools/list_changed notifications (SDK behavior).
+type Surface struct {
+	b       *cmdsurface.Bridge
+	cfg     config
+	srv     *mcp.Server
+	tasks   *taskBinding // nil unless WithTasks
+	confirm *confirmer   // nil unless WithConfirmationElicitation
+	// originGuard wraps the SDK handler in Origin validation when
+	// WithOriginAllowlist was given, and is the identity otherwise.
+	originGuard api.Middleware
+
+	mu         sync.Mutex
+	registered map[string]bool // dotted tool name -> currently added
+}
+
+// New builds a Surface: one MCP tool per leaf where SurfaceMCP is
+// enabled, then any WithServerConfigurator funcs against the built
+// server. The returned Surface serves via Handler / Mount /
+// ServeStdio, or adopters take Server() and wire any SDK transport
+// themselves.
+func New(b *cmdsurface.Bridge, opts ...Option) (*Surface, error) {
+	if b == nil {
+		return nil, errors.New("mcpsdk: nil bridge")
+	}
+	cfg := newConfig(opts...)
+	if err := checkProtected(cfg); err != nil {
+		return nil, err
+	}
+
+	so := &mcp.ServerOptions{}
+	if cfg.serverOptions != nil {
+		cp := *cfg.serverOptions
+		so = &cp
+	}
+	if cfg.instructions != "" {
+		so.Instructions = cfg.instructions
+	}
+
+	tb, err := newTaskBinding(b, cfg.tasks, so)
+	if err != nil {
+		return nil, err
+	}
+	originGuard, err := newOriginGuard(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	var conf *confirmer
+	if cfg.elicitConfirm {
+		if conf, err = newConfirmer(cfg.elicitKey, elicitConfirmTTL); err != nil {
+			return nil, err
+		}
+	}
+
+	s := &Surface{
+		b:           b,
+		cfg:         cfg,
+		tasks:       tb,
+		confirm:     conf,
+		originGuard: originGuard,
+		srv: mcp.NewServer(
+			&mcp.Implementation{Name: cfg.serverName, Version: cfg.serverVersion},
+			so,
+		),
+		registered: make(map[string]bool),
+	}
+	s.Sync()
+	s.srv.AddReceivingMiddleware(s.callerToolList)
+	if tb != nil {
+		if err := tb.ext.Attach(s.srv); err != nil {
+			return nil, fmt.Errorf("mcpsdk: attaching tasks extension: %w", err)
+		}
+	}
+	for _, fn := range cfg.configurators {
+		fn(s.srv)
+	}
+	return s, nil
+}
+
+// Server returns the underlying *mcp.Server for direct SDK use
+// (registering prompts/resources after construction, custom
+// transports, ResourceUpdated notifications, ...).
+func (s *Surface) Server() *mcp.Server { return s.srv }
+
+// Sync reconciles the SDK tool set with the bridge's current
+// SurfaceMCP enablement: newly enabled leaves are added, disabled
+// ones removed. Connected sessions receive tools/list_changed for
+// every effective change (SDK behavior). Call it after mutating
+// enablement directly on the bridge; the Surface's own Hide /
+// Expose call it automatically.
+func (s *Surface) Sync() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, leaf := range s.b.Leaves() {
+		name := toolName(leaf.Path)
+		enabled := leaf.Enabled[cmdsurface.SurfaceMCP]
+		switch {
+		case enabled && !s.registered[name]:
+			s.srv.AddTool(s.toolFor(leaf), s.toolHandler(leaf))
+			s.registered[name] = true
+		case !enabled && s.registered[name]:
+			s.srv.RemoveTools(name)
+			delete(s.registered, name)
+		}
+	}
+}
+
+// toolFor builds the leaf's descriptor and applies the configured
+// decorator, if any.
+func (s *Surface) toolFor(leaf *cmdsurface.Leaf) *mcp.Tool {
+	t := toolFor(leaf)
+	if s.cfg.toolDecorator != nil {
+		s.cfg.toolDecorator(leaf, t)
+	}
+	return t
+}
+
+// Expose enables SurfaceMCP on every leaf matching pattern (see
+// cmdsurface.Bridge.Expose for pattern forms) and syncs the SDK
+// tool set. Returns the receiver for chaining.
+func (s *Surface) Expose(pattern string) *Surface {
+	s.b.Expose(pattern, cmdsurface.SurfaceMCP)
+	s.Sync()
+	return s
+}
+
+// Hide disables SurfaceMCP on every leaf matching pattern and syncs
+// the SDK tool set, unlisting the tools and notifying connected
+// sessions. Returns the receiver for chaining.
+func (s *Surface) Hide(pattern string) *Surface {
+	s.b.Hide(pattern, cmdsurface.SurfaceMCP)
+	s.Sync()
+	return s
+}
+
+// Handler returns an http.Handler serving the Surface over the MCP
+// streamable HTTP transport, every protocol revision on one endpoint.
+// A client that runs the initialize handshake (revisions through
+// 2025-11-25) gets a stateful session: Mcp-Session-Id, and
+// server-to-client requests on the open stream. A 2026-07-28 request
+// carries its revision per request and is served statelessly, with
+// no initialize and no session. The SDK serves the two only from two
+// handlers, so each request is routed to one by the routing
+// precedence of kit's MCP surfaces; see
+// docs/adopters/guides/expose-cli-over-mcp.md. [WithStateless] serves
+// every revision from the stateless handler alone.
+//
+// All protocol handling — version negotiation, session lifecycle,
+// message parsing, error shapes — is the SDK's, including the request
+// body cap (see WithMaxBodyBytes). With WithTasks
+// enabled, the extension's tasks/get, update and cancel methods are
+// registered on the server itself, so the SDK handlers dispatch them
+// alongside every standard method and they inherit the same transport
+// checks.
+//
+// A tools/call whose bearer token lacks a scope the tool declares is
+// answered at the HTTP layer, ahead of the SDK: 403 with the RFC 6750
+// insufficient_scope challenge, as the MCP authorization spec asks.
+//
+// With WithOriginAllowlist the handler is wrapped in Origin
+// validation. The SDK's own DNS-rebinding check on loopback
+// connections is always in force beneath it.
+func (s *Surface) Handler() http.Handler {
+	getServer := func(*http.Request) *mcp.Server { return s.srv }
+	maxBody := api.MaxBodyBytesOrDefault(s.cfg.maxBody)
+	opts := mcp.StreamableHTTPOptions{
+		JSONResponse:               s.cfg.jsonResponse,
+		MaxRequestBodyBytes:        maxBody,
+		DisableLocalhostProtection: s.cfg.noLocalhostProtection,
+	}
+	if s.cfg.stateless {
+		opts.Stateless = true
+		return s.originGuard(s.protect(s.scopeChallenge(mcp.NewStreamableHTTPHandler(getServer, &opts))))
+	}
+	return s.originGuard(s.protect(s.scopeChallenge(newRevisionRouter(getServer, opts))))
+}
+
+// Mount registers the streamable HTTP handler on the router at the
+// configured path (default "/mcp") for the POST, GET, and DELETE
+// methods the transport uses. Unsupported methods are rejected by
+// the SDK handler itself.
+func (s *Surface) Mount(r *api.Router) error {
+	if r == nil {
+		return errors.New("mcpsdk: Mount: nil router")
+	}
+	h := s.Handler()
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		r.Handle(method, s.cfg.path, h.ServeHTTP)
+	}
+	if pr := s.cfg.protected; pr != nil {
+		// Every method the endpoint takes, and the preflight: the
+		// guard answers each at this path, a read with the document.
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPost, http.MethodDelete} {
+			r.Handle(method, pr.MetadataPath(), h.ServeHTTP)
+		}
+	}
+	return nil
+}
+
+// ServeStdio runs the Surface on the process's standard input and
+// output ([StdioTransport]) until ctx is canceled or the client ends
+// its input; the calls read before end of input are answered first,
+// and end of input returns nil. stdio carries no HTTP headers,
+// so under the default gates leaves classified auth-required or
+// requires-confirmation fail closed on this transport. A host that
+// can vouch for its stdio peer establishes it in [WithCallMeta]
+// ([cmdsurface.EstablishedTransport]) or answers the auth gate with
+// [WithAuthenticated]; [WithConfirmationElicitation] lets a client
+// that supports elicitation confirm a call.
+func (s *Surface) ServeStdio(ctx context.Context) error {
+	t := NewStdioTransport(os.Stdin, os.Stdout)
+	return t.SessionEnd(s.srv.Run(ctx, t))
+}
+
+// NewServer builds an *mcp.Server bound to the bridge: one MCP tool
+// per leaf where SurfaceMCP is enabled. Convenience for callers that
+// only need the server; New returns the Surface handle with live
+// Hide / Expose / Sync on top.
+func NewServer(b *cmdsurface.Bridge, opts ...Option) (*mcp.Server, error) {
+	s, err := New(b, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return s.srv, nil
+}
+
+// Handler is the package-level convenience for New(...).Handler().
+func Handler(b *cmdsurface.Bridge, opts ...Option) (http.Handler, error) {
+	s, err := New(b, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return s.Handler(), nil
+}
+
+// Mount is the package-level convenience for New(...).Mount(r).
+func Mount(b *cmdsurface.Bridge, r *api.Router, opts ...Option) error {
+	if r == nil {
+		return errors.New("mcpsdk: Mount: nil router")
+	}
+	s, err := New(b, opts...)
+	if err != nil {
+		return err
+	}
+	return s.Mount(r)
+}
+
+// ServeStdio is the package-level convenience for
+// New(...).ServeStdio(ctx).
+func ServeStdio(ctx context.Context, b *cmdsurface.Bridge, opts ...Option) error {
+	s, err := New(b, opts...)
+	if err != nil {
+		return err
+	}
+	return s.ServeStdio(ctx)
+}
+
+// newOriginGuard builds the WithOriginAllowlist check, or the
+// identity when the option was not given.
+func newOriginGuard(cfg config) (api.Middleware, error) {
+	if !cfg.originCheck {
+		return func(h http.Handler) http.Handler { return h }, nil
+	}
+	mw, err := api.OriginCheck(api.OriginCheckConfig{
+		Allow:  cfg.origins,
+		Refuse: RefuseJSONRPC,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mcpsdk: %w", err)
+	}
+	return mw, nil
+}
+
+// RefuseJSONRPC writes an HTTP-plane refusal the way the MCP
+// transport expects one: the HTTP status, and a JSON-RPC error with
+// a null id (the request was never parsed), code -32600, its message
+// led by the stable code and data.code carrying it. It is an
+// [api.RefusalWriter], for a listener serving Handler that runs its
+// own Host, Origin or body-limit checks in front of it.
+func RefuseJSONRPC(w http.ResponseWriter, _ *http.Request, e *api.APIError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(e.Status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      nil,
+		"error": map[string]any{
+			"code":    -32600,
+			"message": e.Code + ": " + e.Message,
+			"data":    map[string]string{"code": e.Code},
+		},
+	})
+}
