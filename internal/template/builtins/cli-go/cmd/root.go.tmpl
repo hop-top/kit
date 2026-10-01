@@ -1,0 +1,181 @@
+// Package cmd wires {{.Name}}'s commands onto a kit root.
+//
+// The root carries the kit global flags (--format, --quiet, --no-color,
+// -c/--config, -v/--verbose, ...), the reserved `status` and `spec`
+// verbs (`spec coverage` is the side-effect annotation gate), and the
+// `serve` supervisor with the built-in api, socket, mcp and rpc
+// services registered. Every command added to root.Cmd is reachable
+// from the shell and, under `serve`, over REST, the Unix socket, MCP
+// and gRPC behind the same safety policy — there is nothing to mount.
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+
+	"github.com/spf13/cobra"
+
+	speccli "hop.top/kit/go/ai/toolspec/cli"
+	"hop.top/kit/go/console/cli"
+	"hop.top/kit/go/console/cli/mcpserve"
+	"hop.top/kit/go/console/cli/rpcserve"
+	"hop.top/kit/go/console/output"
+	"hop.top/kit/go/core/config"
+	"{{.Module}}/internal/version"
+)
+
+// root is built once, at package initialization, so each command
+// file in this package registers itself from an init function
+// (see hello.go).
+var root = newRoot()
+
+func newRoot() *cli.Root {
+	var r *cli.Root
+	r = cli.New(cli.Config{
+		Name:    "{{.Name}}",
+		Version: version.Version(),
+		Short:   "{{.Description}}",
+		Hooks: cli.Hooks{
+			PrePersistentRunE: func(*cobra.Command, []string) error { return loadConfig(r) },
+		},
+	},
+		// `status` is the introspection verb every kit root is validated
+		// to carry.
+		cli.WithStatus(cli.StatusConfig{}),
+		// `serve api`: the command tree over REST on 127.0.0.1:8080, with
+		// discovery at /v1/commands and an OpenAPI document. Enabled by
+		// default under a bare `serve`. A non-loopback address needs
+		// Auth, or services.api.insecure_remote by name.
+		cli.WithAPI(cli.APIConfig{}),
+		// `serve socket`: the same tree over an owner-only Unix socket.
+		// Registered but not enabled; `serve socket` starts it, or set
+		// services.socket.enabled in the config file.
+		cli.WithSocket(cli.SocketConfig{}),
+		// `serve mcp`: the same tree as MCP tools, one per command, on
+		// its own listener at http://127.0.0.1:8081/mcp, or over stdio
+		// for a desktop host that spawns `{{.Name}} serve mcp --stdio`.
+		// Registered but not enabled, like the socket. It links the
+		// MCP SDK, which adds about 2 MB to a stripped release binary
+		// (3 MB with symbols); delete this option and its import to
+		// drop both.
+		mcpserve.With(mcpserve.Config{}),
+		// `serve rpc`: the same tree as the cmdsurface.v1.Commands
+		// service, for Connect, gRPC and gRPC-Web clients on one port,
+		// 127.0.0.1:8082. Registered but not enabled, like the socket.
+		// It adds about 0.4 MB to a stripped release binary (0.6 MB with
+		// symbols); delete this option and its import to drop it.
+		rpcserve.With(rpcserve.Config{}),
+	)
+	// `spec`: the machine-readable manifest agents read, and `spec
+	// coverage`, which lists every command that declares no
+	// kit/side-effect. `spec coverage --min 100` in CI keeps it at 100%.
+	// Registration order does not matter: both walk the tree when run.
+	if err := speccli.RegisterSpecCommand(r, "1.0"); err != nil {
+		panic(err)
+	}
+	serveDefaults(r)
+	return r
+}
+
+// serveDefaults sets {{.Name}}'s middleware defaults for every served
+// service, under services.all. They sit below every config file,
+// environment variable and -c override: a key set there wins, and a
+// key under one service (services.api.rate_limit.enabled) wins over
+// the shared one. Every key is listed in kit's served middleware
+// reference.
+func serveDefaults(r *cli.Root) {
+	for key, value := range map[string]any{
+		// Refuse request bodies over the cap with 413 body_too_large:
+		// 1 MiB on the api and mcp listeners, 4 MiB on rpc.
+		"services.all.body_limit.enabled": true,
+		// Give a client 5s to send its request and 10s to read a
+		// request/reply answer; stream responses are exempt.
+		"services.all.timeouts.read_header": "5s",
+		"services.all.timeouts.read":        "5s",
+		"services.all.timeouts.write":       "10s",
+		// Cancel a served command after 5 minutes unless it declares
+		// its own kit/timeout; the caller gets deadline_exceeded.
+		"services.all.timeouts.command": "5m",
+		// Rate-limit each caller per side-effect tier, on loopback
+		// too (kit's own default starts it beyond loopback only); the
+		// excess gets 429 rate_limited with Retry-After.
+		"services.all.rate_limit.enabled": true,
+		// Answer /healthz and /readyz without credentials.
+		"services.all.health.enabled": true,
+	} {
+		r.Viper.SetDefault(key, value)
+	}
+}
+
+// Execute runs the CLI and returns the error the root reports.
+func Execute() error {
+	return root.Execute(context.Background())
+}
+
+// ExitCode maps an error returned by Execute onto the process exit
+// code. Kit's structured errors carry their own — 2 for a usage
+// error, 3 for not found, 5 for unauthorized, and so on — and an
+// error without one exits 1.
+func ExitCode(err error) int {
+	type withCLIError interface{ AsCLIError() *output.Error }
+	var ce withCLIError
+	if errors.As(err, &ce) {
+		if out := ce.AsCLIError(); out != nil && out.ExitCode != 0 {
+			return out.ExitCode
+		}
+	}
+	return 1
+}
+
+// loadConfig layers the configuration into root.Viper before any
+// command runs, in kit's precedence: flags beat the environment
+// ({{.NameUpper}}_<KEY>, dots as underscores), which beats the config
+// files, which beat defaults. `-c <path>` merges one more file and
+// `-c key=value` overrides one key; both come from kit's own flag.
+//
+// Everything `serve` reads — services.api.addr, services.api.enabled,
+// services.socket.path, services.mcp.transport, services.rpc.addr, ...
+// — resolves through here.
+func loadConfig(r *cli.Root) error {
+	if err := config.BindEnv(r.Viper, "{{.NameUpper}}"); err != nil {
+		return err
+	}
+	extra, overrides, err := r.ConfigArgs()
+	if err != nil {
+		return err
+	}
+	// System, then user (~/.config/{{.Name}}/config.yaml), then the
+	// nearest project marker: later layers win.
+	layers := config.OptionsForTool("{{.Name}}")
+	for _, path := range []string{layers.SystemConfigPath, layers.UserConfigPath, layers.ProjectConfigPath} {
+		if err := mergeConfigFile(r, path, false); err != nil {
+			return err
+		}
+	}
+	for _, path := range extra {
+		if err := mergeConfigFile(r, path, true); err != nil {
+			return err
+		}
+	}
+	for key, value := range overrides {
+		r.Viper.Set(key, value)
+	}
+	return nil
+}
+
+// mergeConfigFile merges one YAML file into root.Viper. A missing
+// file in a conventional slot is skipped; a missing file the user
+// named with -c is an error.
+func mergeConfigFile(r *cli.Root, path string, required bool) error {
+	if path == "" {
+		return nil
+	}
+	r.Viper.SetConfigFile(path)
+	err := r.Viper.MergeInConfig()
+	if err == nil || (!required && errors.Is(err, fs.ErrNotExist)) {
+		return nil
+	}
+	return fmt.Errorf("config %s: %w", path, err)
+}

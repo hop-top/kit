@@ -1,0 +1,12 @@
+# lychee config — link checker for docs/ and README.md.
+#
+# No path excludes: every relative link must resolve inside the repo.
+# Documents that live outside the repo are not linked at all; `make
+# lint-internal-refs` keeps their names out of the tree.
+
+# Reasonable timeouts.
+timeout = 20
+retry_wait_time = 2
+max_retries = 2
+
+# Offline by default — Makefile invocation passes --offline.
