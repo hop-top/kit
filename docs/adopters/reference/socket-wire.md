@@ -1,0 +1,275 @@
+# socket wire reference
+
+Wire reference for
+[`go/transport/socket`](../../../go/transport/socket/README.md), which
+serves a kit command tree over a Unix domain socket as
+newline-delimited JSON: the request and response shapes, the
+surface, error codes, authentication, cancellation, configuration
+keys, path limits and permissions, and the Go API. The task walkthrough is
+[serve-cli-over-unix-socket.md](../guides/serve-cli-over-unix-socket.md).
+
+## Wire protocol
+
+One JSON object per line in each direction. Requests on a connection
+are answered in order. A connection may carry any number of requests.
+
+### Request
+
+```json
+{"path":["widget","get"],"args":["7"],"flags":{"format":"json"},"caller":"daemon","tenant":"acme","request_id":"r-1","trace_id":"abc123","idempotency_key":"k-1"}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `path` | `[]string` | yes | command path from root to leaf, e.g. `["widget","get"]` |
+| `args` | `[]string` | no | positional arguments after the path |
+| `flags` | `object` | no | flags keyed by long name; values as the command expects them |
+| `caller` | `string` | no | claimed principal, forwarded to audit sinks as provenance; replaced by the authenticator's verdict when one is configured |
+| `tenant` | `string` | no | claimed tenant, under the same terms as `caller` |
+| `request_id` | `string` | no | request identifier for the audit trail; issued by the server when absent |
+| `trace_id` | `string` | no | trace identifier propagated across surfaces |
+| `idempotency_key` | `string` | no | makes the request replayable: a repeat of a request that succeeded, from the same `caller`, is answered from its record with `"replayed":true` and nothing runs ([contract](../../contracts/serve-lifecycle.md#idempotency)); also forwarded to the command's `--idempotency-key` flag when it registers one |
+
+`path` must be non-empty. Without an [`Authenticator`](#authentication),
+`caller` and `tenant` are **not** credentials: they are recorded,
+never verified, and grant nothing.
+
+### Response
+
+```json
+{"ok":true,"result":{"exit_code":0,"data":{"id":7,"name":"bolt"}}}
+```
+
+```json
+{"ok":true,"result":{"exit_code":0,"stdout":"widget-1\nwidget-2\n"}}
+```
+
+```json
+{"ok":false,"error":{"code":"NOT_FOUND","message":"cmdsurface: unknown command: nosuch"}}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ok` | `bool` | `true` when the command ran; `false` when the request was refused before reaching it |
+| `result` | `object` | present when `ok` is `true` |
+| `result.exit_code` | `int` | the command's exit status; `0` on success |
+| `result.stdout` | `string` | captured standard output; omitted when empty |
+| `result.stderr` | `string` | captured standard error; omitted when empty |
+| `result.data` | `any` | the command's declared output, decoded; omitted when the command declares no output schema or the request named a non-json `format` |
+| `error` | `object` | present when `ok` is `false` |
+| `error.code` | `string` | stable symbol, table below |
+| `error.message` | `string` | human-readable detail |
+| `replayed` | `bool` | `true` when `result` is the recorded answer to an earlier request with the same `idempotency_key`; omitted otherwise |
+
+`ok:true` with a non-zero `exit_code` means the command ran and
+failed. `ok:false` means it never ran.
+
+Which of `data` and `stdout` a result carries follows the
+[execution contract](../../contracts/serve-lifecycle.md#format-selection-and-structured-output):
+
+| Command declares an output schema | Request `flags.format` | `stdout` | `data` |
+|---|---|---|---|
+| yes | absent | omitted | present |
+| yes | `"json"` | the JSON text | present |
+| yes | any other | that rendering | omitted |
+| no | anything | as the command produced it | omitted |
+
+A request runs with its connection's context: a client that hangs up
+mid-command cancels it (see [Cancellation](#cancellation)), and the
+result is discarded. Stopping the service cancels every command in
+flight. Requests on one connection are answered in order; across
+connections the bridge's runner serializes in-process commands, one
+at a time, unless the tool opts in with `cli.WithRootFactory`, which
+runs each request on a tree of its own, in parallel.
+
+## Surface
+
+The built-in service (`cli.WithSocket`) invokes every request as
+`cmdsurface.SurfaceSocket` (`socket`), a surface of its own. Policy, enablement, and audit sinks key
+off that value: a destructive command runs only when
+`Policy.AllowDestructiveOn` names `SurfaceSocket`, and audit records
+carry `surface: socket`. `SurfaceRPC` is ConnectRPC; naming it grants
+the socket nothing.
+
+## Error codes
+
+| Code | Cause |
+|---|---|
+| `NOT_FOUND` | `path` resolves to no reachable command, including one the reflector excluded (hidden, deprecated) |
+| `NOT_ENABLED` | the command exists but is not exposed on the `socket` surface |
+| `NOT_INVOCABLE` | the command can never run through a transport — interactive, or self-hosting — refused by the bridge's gate; the message names the reason |
+| `BLOCKED` | destructive command refused because the policy does not name the `socket` surface |
+| `DENIED` | the permission gate refused this caller; the message carries its stable reason |
+| `UNAUTHENTICATED` | the configured `Authenticator` refused the request (the [peer authenticator](#peer-credentials) or your own); never sent without one |
+| `RATE_LIMITED` | the caller's rate limit is spent; `retry_after_ms` says how long until it refills |
+| `CONFLICT` | the `idempotency_key` names a request still running (`idempotency_conflict` in the message), or was used for a different command (`idempotency_key_reused`) |
+| `QUOTA_EXCEEDED` | the caller's quota for the window is spent; `retry_after_ms` says how long until the window resets |
+| `INVALID` | malformed request line, or empty `path` |
+| `INTERNAL` | any other runner error |
+
+A malformed line does not close the connection; the next request is
+served normally.
+
+## Authentication
+
+The transport ships without an authenticator: the socket file's
+`0600` permission is the access control, and for the common case
+that is the authentication. `Transport.Auth` (an `Authenticator`,
+`cli.SocketConfig.Auth` for the built-in service) verifies each
+request before it is invoked. It receives the connection, so it may
+read peer credentials from the kernel, and the request, so it may
+verify something the caller sent. A non-nil error answers
+`UNAUTHENTICATED`; the returned `Identity` replaces the request's
+claimed `caller` and `tenant` in `Meta`, and its `Scopes` become
+`Meta.Extra["scopes"]`, which the permission gate checks against a
+command's `kit/permissions` as it checks a verified token's.
+
+A refusal never reaches the bridge, so the transport reports it
+through `Transport.OnRefused` with an error wrapping
+`cmdsurface.ErrAuthRefused`; the built-in service routes that into
+`Bridge.Audit`, so the refusal lands in the same audit stream as the
+bridge's own verdicts. `Identity.Extra` becomes the invocation's
+`Meta.Extra` whichever way the authenticator decided, so a refusal's
+audit record carries what it saw.
+
+An identity an authenticator returned is `verified`
+(`cmdsurface.EstablishedVerified`); without an authenticator it is
+`transport` (the `0600` file). Both run a `kit/auth-required` command.
+
+### Peer credentials
+
+`socket.NewPeerAuthenticator(socket.PeerAuthConfig{...})` is the
+authenticator kit ships, and what `services.socket.auth.mode: peer`
+installs on the built-in service in place of `SocketConfig.Auth`. It
+asks the kernel who opened the connection — `SO_PEERCRED` on Linux,
+`LOCAL_PEERCRED` (plus `LOCAL_PEERPID`) on macOS and FreeBSD — so no
+client can forge the answer.
+
+| Result | Value |
+|---|---|
+| `Meta.Caller` | `uid:<n>`, the peer's effective uid; its user name with `ResolveNames`, `uid:<n>` when the uid has no user entry |
+| `Meta.Tenant` | empty |
+| `Meta.Extra` | `peer_uid`, `peer_gid` (effective), `peer_pid` (absent on FreeBSD); `scopes` when the peer holds any |
+| scopes | what `PeerAuthConfig.Scopes(cred)` returns for an admitted peer; none when it is nil |
+| refusal | `UNAUTHENTICATED`: `peer uid <n> is not the server's uid <m>` under `RequireSameUID`; `socket: peer credentials: ...` when the kernel cannot answer |
+
+`RequireSameUID` refuses every uid but the server process's. The
+`0600` file already confines callers to that uid and root; the option
+turns root away too. On any other platform `NewPeerAuthenticator`
+returns `ErrPeerCredUnsupported`, and the built-in service refuses
+`mode: peer` at exit `2`. `socket.PeerCredentials(conn)` is the
+kernel query on its own, for an authenticator you write.
+
+A peer holds no scopes by default, so a command declaring
+`kit/permissions` is refused over the socket as `DENIED`, led by
+`cmdsurface: insufficient scope`, until something grants them. On the
+built-in service, `services.socket.auth.peer.scopes` grants its list
+to every admitted peer; without it, `cli.SocketConfig.PeerScopes`
+maps each peer's credentials to its scopes:
+
+```go
+cli.WithSocket(cli.SocketConfig{
+    PeerScopes: func(c socket.PeerCred) []string {
+        if c.UID == 0 {
+            return []string{"widgets:admin"}
+        }
+        return []string{"widgets:read"}
+    },
+})
+```
+
+A configured list replaces `PeerScopes` rather than joining it, as a
+configured list replaces a code value everywhere under `services.*`;
+an empty list grants nothing.
+
+## Cancellation
+
+Requests on a connection are answered in order but read ahead: a
+reader goroutine keeps consuming lines while a command runs, so a peer
+that hangs up mid-command is noticed immediately and the connection's
+context — the one the invocation received — is canceled. Up to 16
+requests may be read ahead; past that, a client that floods without
+reading responses is not observed until the backlog drains.
+
+## Configuration
+
+| Key | Type | Default |
+|---|---|---|
+| `services.socket.enabled` | bool | `false` |
+| `services.socket.path` | string | `<runtime dir>/<tool>/<tool>.sock` |
+| `services.socket.ready_timeout` | duration | `30s` |
+| `services.socket.stop_timeout` | duration | `30s` |
+| `services.socket.auth.mode` | string | unset: no authenticator; `peer` installs the [peer authenticator](#peer-credentials) |
+| `services.socket.auth.peer.require_same_uid` | bool | `false` |
+| `services.socket.auth.peer.resolve_names` | bool | `false` |
+| `services.socket.auth.peer.scopes` | list of strings | unset: `SocketConfig.PeerScopes`, else no scopes |
+
+The `auth` keys may also be set under `services.all`. Refused at
+exit `2`, naming the key: `auth.mode: mtls` under `services.socket`
+(it needs an HTTP listener; under `services.all` it is the HTTP
+listeners' default and the socket does not read it), an unknown
+mode, an `auth.peer` key without `mode: peer`, a value that is not a
+bool, `scopes` that is not a list of names, `mode: peer` on a platform
+without peer credentials, and an `auth.peer` key under any service but
+the socket.
+
+Path precedence, highest first:
+
+1. `--socket <path>`
+2. `services.socket.path` (or `<TOOL>_SERVICES_SOCKET_PATH`)
+3. `SocketConfig.Path`
+4. `<runtime dir>/<tool>/<tool>.sock`
+
+The runtime dir is `$XDG_RUNTIME_DIR` when set, otherwise the
+platform's location for ephemeral per-user files (on macOS
+`~/Library/Application Support`), falling back to the OS temp
+directory.
+
+## Path limits and permissions
+
+- The resolved path is made absolute.
+- Paths longer than **103 bytes** are refused at startup with exit
+  `2`. The limit is `sockaddr_un.sun_path`: 104 bytes on macOS and
+  the BSDs, 108 on Linux; the lower bound is enforced everywhere so a
+  configuration is portable.
+- The socket file is created with mode **`0600`**. On a Unix socket
+  the filesystem permission is the access control.
+- A stale socket file — one no process is listening on — is removed
+  and reclaimed at start. A socket a live process is listening on is
+  refused with `already in use`.
+- A path that exists and is not a socket is refused, and the file is
+  left untouched.
+- `Close` unlinks the socket file.
+
+## API
+
+| Symbol | Purpose |
+|---|---|
+| `New(path)` | construct the transport |
+| `Transport` | implements `transportsvc.Transport` |
+| `Request`, `Response`, `Error` | wire types |
+| `Authenticator`, `Identity` | the per-request verification hook and its verdict |
+| `NewPeerAuthenticator`, `PeerAuthConfig` | the peer-credential authenticator and its options |
+| `PeerCredentials`, `PeerCred` | the kernel's uid, gid and pid for a connection |
+| `ErrPeerCredUnsupported` | returned on a platform without peer credentials |
+| `ExtraPeerUID`, `ExtraPeerGID`, `ExtraPeerPID` | the `Meta.Extra` keys the peer authenticator records |
+| `Transport.Auth`, `Transport.OnRefused` | install the hook; observe its refusals |
+| `CodeNotFound`, `CodeNotEnabled`, `CodeNotInvocable`, `CodeBlocked`, `CodeDenied`, `CodeUnauthenticated`, `CodeRateLimited`, `CodeInvalid`, `CodeInternal` | error-code constants |
+| `SocketMode` | the `0600` the socket file is created with |
+
+Register it through
+[`cli.WithSocket`](../../../go/console/cli/serve_socket.go) rather than
+constructing the service by hand.
+
+## Related pages
+
+- [serve-cli-over-unix-socket.md](../guides/serve-cli-over-unix-socket.md):
+  the task walkthrough
+- [transportsvc reference](transportsvc.md): the lifecycle seam this
+  transport plugs into
+- [serve lifecycle contract](../../contracts/serve-lifecycle.md): the
+  Security section states the provenance and permission rules
+- [secure-remote-serving.md](../guides/secure-remote-serving.md): the
+  permission gate and audit trail, walked through
+- [`go/transport/rpc`](../../../go/transport/rpc/): ConnectRPC and
+  protobuf, when you need a schema rather than dynamic dispatch
