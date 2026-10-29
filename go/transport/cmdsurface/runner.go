@@ -1,0 +1,465 @@
+package cmdsurface
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"hop.top/kit/go/console/output"
+)
+
+// ErrUnknownCommand is returned when an Invocation.Path cannot be
+// resolved to a cobra command in the root tree. The Bridge maps
+// this to a transport-appropriate "not found" response (REST 404,
+// MCP error, etc.).
+var ErrUnknownCommand = errors.New("cmdsurface: unknown command")
+
+// Runner executes an Invocation against some backing implementation
+// (in-process cobra, subprocess, sandboxed). The bridge holds one
+// Runner; surfaces invoke through the bridge so policy applies
+// uniformly regardless of which Runner is wired.
+type Runner interface {
+	// Run executes inv synchronously and returns a single Result.
+	// The implementation MUST honor ctx for cancellation.
+	Run(ctx context.Context, inv Invocation) (Result, error)
+	// Stream executes inv and emits Events as they are produced
+	// (stdout / stderr lines, optional progress payloads). The
+	// final event MUST have Kind == "done" and Data == *Result
+	// (or nil on error). out is closed by the Runner when streaming
+	// completes; callers must not close it.
+	Stream(ctx context.Context, inv Invocation, out chan<- Event) error
+}
+
+// Run implements Runner. The invocation runs on the runner's tree
+// with the caller's context, captured streams, and no stdin; see
+// [InProcessRunner] for what is isolated between invocations. A
+// command that fails while ctx is done is reported as a cancellation
+// through the returned error, alongside the partial Result.
+func (r *inProcessRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
+	ex, err := r.prepare(ctx, inv)
+	if err != nil {
+		return Result{}, err
+	}
+	defer ex.release()
+
+	stdout, stderr := r.newCapture(), r.newCapture()
+	ex.attach(stdout, stderr)
+
+	execErr := ex.root.ExecuteContext(ctx)
+	res := ex.result(execErr, stdout, stderr)
+	return res, canceled(ctx, execErr)
+}
+
+// Stream implements Runner. It produces one Event per output line
+// (Kind="stdout"/"stderr"; a line longer than [MaxEventLineBytes]
+// spans several) followed by a terminal Event{Kind:"done"} carrying
+// the same Result Run would have returned, Data included. out is
+// closed when streaming completes. Cancellation is reported the way
+// Run reports it, after the done event.
+func (r *inProcessRunner) Stream(ctx context.Context, inv Invocation, out chan<- Event) error {
+	if out == nil {
+		return errors.New("cmdsurface: nil event channel")
+	}
+	defer close(out)
+
+	ex, err := r.prepare(ctx, inv)
+	if err != nil {
+		return err
+	}
+	defer ex.release()
+
+	outR, outW := io.Pipe()
+	errR, errW := io.Pipe()
+
+	// Events carry every line; the copy kept for the done Result is
+	// capped as Run's is.
+	stdoutBuf, stderrBuf := r.newCapture(), r.newCapture()
+	ex.attach(io.MultiWriter(outW, stdoutBuf), io.MultiWriter(errW, stderrBuf))
+
+	// Readers drain each pipe and forward one Event per line.
+	var lines streamReaders
+	lines.start(outR, "stdout", out)
+	lines.start(errR, "stderr", out)
+
+	execErr := ex.root.ExecuteContext(ctx)
+	// Closing the writers tells the readers to drain remaining
+	// bytes and exit cleanly.
+	_ = outW.Close()
+	_ = errW.Close()
+	readErr := lines.wait()
+
+	res := ex.result(execErr, stdoutBuf, stderrBuf)
+	out <- Event{Kind: "done", Data: &res, At: time.Now()}
+	if err := canceled(ctx, execErr); err != nil {
+		return err
+	}
+	return readErr
+}
+
+// resolveLeaf walks the cobra tree from root following path and
+// returns the matching command. An empty path resolves to root.
+// Returns ErrUnknownCommand when any path segment cannot be matched.
+func resolveLeaf(root *cobra.Command, path []string) (*cobra.Command, error) {
+	if len(path) == 0 {
+		return root, nil
+	}
+	cmd, remaining, err := root.Find(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrUnknownCommand, joinPath(path), err)
+	}
+	if len(remaining) != 0 {
+		return nil, fmt.Errorf("%w: unresolved segments %v under %q",
+			ErrUnknownCommand, remaining, cmd.CommandPath())
+	}
+	return cmd, nil
+}
+
+// buildArgs converts an Invocation into the cobra argv form:
+//
+//	[<path...>, --flag=<value>..., --, <args...>]
+//
+// Bool flags whose value is true are emitted as --flag (no value);
+// false bool flags are omitted entirely. Other flag values are
+// rendered with fmt %v.
+//
+// The "--" end-of-options marker precedes the args whenever there
+// are any, so an argument spelled like a flag ("-x", "--help") is
+// read as the argument it is. A leaf that parses its own argv
+// (ownArgv) gets its args verbatim: nothing in kit parses them, and
+// the marker would reach the program it forwards to as an argument.
+func buildArgs(inv Invocation) []string {
+	out := make([]string, 0, len(inv.Path)+len(inv.Flags)+1+len(inv.Args))
+	out = append(out, inv.Path...)
+	for _, k := range sortedKeys(inv.Flags) {
+		v := inv.Flags[k]
+		switch tv := v.(type) {
+		case bool:
+			if tv {
+				out = append(out, "--"+k)
+			}
+		default:
+			out = append(out, fmt.Sprintf("--%s=%v", k, v))
+		}
+	}
+	if len(inv.Args) > 0 && !inv.ownArgv {
+		out = append(out, "--")
+	}
+	out = append(out, inv.Args...)
+	return out
+}
+
+// captureRootWriters installs the output writers and argv on root
+// and returns a function that restores the prior values. Also flips
+// SilenceUsage/SilenceErrors so cobra does not interleave its own
+// help text into the captured streams on error.
+func captureRootWriters(root *cobra.Command, outW, errW io.Writer, args []string) func() {
+	prevOut := root.OutOrStdout()
+	prevErr := root.ErrOrStderr()
+	prevSilenceUsage := root.SilenceUsage
+	prevSilenceErrors := root.SilenceErrors
+
+	root.SetOut(outW)
+	root.SetErr(errW)
+	root.SetArgs(args)
+	root.SilenceUsage = true
+	root.SilenceErrors = true
+
+	return func() {
+		root.SetOut(prevOut)
+		root.SetErr(prevErr)
+		root.SetArgs(nil)
+		root.SilenceUsage = prevSilenceUsage
+		root.SilenceErrors = prevSilenceErrors
+	}
+}
+
+// joinPath renders a command path slice as "a b c" for error
+// messages.
+func joinPath(path []string) string {
+	if len(path) == 0 {
+		return "(root)"
+	}
+	out := path[0]
+	for _, p := range path[1:] {
+		out += " " + p
+	}
+	return out
+}
+
+// SubprocessRunner returns a Runner that shells out to binaryPath
+// for each Invocation. The child is spawned with exec.CommandContext
+// so context cancellation propagates to the OS process. On Unix the
+// child is placed in its own process group (Setpgid) and cancellation
+// kills the entire group with SIGKILL, ensuring grandchildren do not
+// leak. On Windows the cancellation path falls back to a best-effort
+// cmd.Process.Kill() — see runner_windows.go.
+//
+// The binary is invoked as:
+//
+//	<binaryPath> <inv.Path...> [--flag=val ...] [-- inv.Args...]
+//
+// The "--" is omitted when there are no args, and for a leaf the
+// bridge admitted as parsing its own argv (cobra DisableFlagParsing).
+//
+// Each Invocation runs a fresh process; SubprocessRunner is safe for
+// concurrent use.
+//
+// The Result keeps at most [DefaultOutputCap] bytes of each stream,
+// or the bound [WithOutputCap] sets; the child's output past it is
+// read and discarded, so the child runs to completion.
+//
+// The child inherits the server's environment. When the Invocation
+// carries a trace context (Meta.Traceparent), the child also receives
+// it as TRACEPARENT and TRACESTATE, the environment-variable carrier
+// OpenTelemetry SDKs read at start-up, so a traced child continues
+// the caller's trace; any TRACEPARENT or TRACESTATE the server itself
+// inherited is replaced rather than duplicated. Without one the
+// server's own trace variables pass through. The child also receives
+// the invocation's [IdempotencyScope] as [EnvIdempotencyScope], so
+// its --idempotency-key replay is confined to the caller exactly as
+// an in-process run's is (see [ScopeIdempotencyKey]).
+func SubprocessRunner(binaryPath string, opts ...RunnerOption) Runner {
+	r := &subprocessRunner{binary: binaryPath}
+	for _, o := range opts {
+		o(&r.runnerConfig)
+	}
+	return r
+}
+
+type subprocessRunner struct {
+	runnerConfig
+	binary string
+}
+
+// Run executes the binary with the Invocation's argv synthesized from
+// Path + Flags + Args, buffers stdout/stderr up to the output cap
+// (see [WithOutputCap]), and returns a Result with the captured
+// streams and exit code. If ctx is canceled while
+// the process is running the process group is killed and the wrapped
+// ctx.Err() is returned alongside the partial Result.
+func (r *subprocessRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
+	if r.binary == "" {
+		return Result{}, errors.New("cmdsurface: SubprocessRunner: empty binary path")
+	}
+
+	argv := buildArgs(inv)
+	cmd := exec.CommandContext(ctx, r.binary, argv...)
+	cmd.Env = childEnv(inv.Meta)
+
+	pipes, err := newChildPipes(cmd)
+	if err != nil {
+		return Result{}, err
+	}
+	defer pipes.close()
+
+	applySubprocessAttrs(cmd)
+	// Cancel callback: on ctx.Done, kill the whole process group so
+	// any grandchildren the binary spawned do not leak. Falls back
+	// to cmd.Process.Kill() on platforms without process groups.
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	// WaitDelay bounds a child that outlives its Cancel. Output is
+	// drained by childPipes, not os/exec, so it never cuts output.
+	cmd.WaitDelay = 100 * time.Millisecond
+
+	// Each copy reads its pipe to EOF whatever the cap: output past it
+	// is discarded, never left in the pipe for the child to block on.
+	stdout, stderr := r.newCapture(), r.newCapture()
+	runErr := cmd.Start()
+	pipes.started()
+	if runErr == nil {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = io.Copy(stdout, pipes.stdout) }()
+		go func() { defer wg.Done(); _, _ = io.Copy(stderr, pipes.stderr) }()
+		runErr = cmd.Wait()
+		pipes.exited()
+		wg.Wait()
+		runErr = pipes.waitErr(runErr)
+	}
+
+	res := Result{
+		Stdout:    stdout.String(),
+		Stderr:    stderr.String(),
+		Truncated: stdout.truncated() || stderr.truncated(),
+	}
+	if runErr != nil {
+		res.ExitCode = exitCodeOf(runErr)
+		// If ctx was canceled, surface that as the returned error so
+		// callers can distinguish a genuine subprocess failure from a
+		// caller-initiated abort.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return res, fmt.Errorf("cmdsurface: subprocess canceled: %w", ctxErr)
+		}
+		// A non-ExitError run failure (binary not found, permission
+		// denied, etc.) is returned as an error; an ExitError with a
+		// non-zero status is surfaced only via res.ExitCode.
+		var exitErr *exec.ExitError
+		if !errors.As(runErr, &exitErr) {
+			return res, fmt.Errorf("cmdsurface: subprocess run: %w", runErr)
+		}
+	}
+	return res, nil
+}
+
+// Stream executes the binary and emits one Event per line of stdout
+// or stderr (a line longer than [MaxEventLineBytes] spans several),
+// followed by a terminal Event{Kind:"done"} carrying the *Result Run
+// would have returned. The output channel is closed by Stream when streaming
+// completes; callers must not close it.
+func (r *subprocessRunner) Stream(ctx context.Context, inv Invocation, out chan<- Event) error {
+	if out == nil {
+		return errors.New("cmdsurface: nil event channel")
+	}
+	defer close(out)
+
+	if r.binary == "" {
+		return errors.New("cmdsurface: SubprocessRunner: empty binary path")
+	}
+
+	argv := buildArgs(inv)
+	cmd := exec.CommandContext(ctx, r.binary, argv...)
+	cmd.Env = childEnv(inv.Meta)
+
+	// childPipes rather than cmd.StdoutPipe()/StderrPipe(): Wait
+	// closes StdoutPipe's read end, racing readers not yet scheduled,
+	// and an io.Writer would put os/exec's copy, and so the WaitDelay
+	// cut, behind this channel's consumer.
+	pipes, err := newChildPipes(cmd)
+	if err != nil {
+		return err
+	}
+	defer pipes.close()
+
+	applySubprocessAttrs(cmd)
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	cmd.WaitDelay = 100 * time.Millisecond
+
+	err = cmd.Start()
+	pipes.started()
+	if err != nil {
+		return fmt.Errorf("cmdsurface: subprocess start: %w", err)
+	}
+
+	// Tee each pipe so we keep a copy for the terminal Result while
+	// emitting one Event per line live. Events carry every line; the
+	// copy holds the bytes as read, capped as Run's is.
+	stdoutBuf, stderrBuf := r.newCapture(), r.newCapture()
+	var lines streamReaders
+	lines.start(io.TeeReader(pipes.stdout, stdoutBuf), "stdout", out)
+	lines.start(io.TeeReader(pipes.stderr, stderrBuf), "stderr", out)
+
+	waitErr := cmd.Wait()
+	pipes.exited()
+	readErr := lines.wait()
+	waitErr = pipes.waitErr(waitErr)
+
+	res := &Result{
+		Stdout:    stdoutBuf.String(),
+		Stderr:    stderrBuf.String(),
+		Truncated: stdoutBuf.truncated() || stderrBuf.truncated(),
+	}
+	if waitErr != nil {
+		res.ExitCode = exitCodeOf(waitErr)
+	}
+	out <- Event{Kind: "done", Data: res, At: time.Now()}
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("cmdsurface: subprocess canceled: %w", ctxErr)
+	}
+	// Same policy as Run: only surface non-ExitError failures.
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			return fmt.Errorf("cmdsurface: subprocess wait: %w", waitErr)
+		}
+	}
+	// An orphan cut is reported through waitErr above.
+	if readErr != nil && !errors.Is(readErr, errOrphanCut) {
+		return readErr
+	}
+	return nil
+}
+
+// Environment variables carrying W3C trace context to a child
+// process, as the OpenTelemetry environment-carrier specification
+// names them.
+const (
+	envTraceparent = "TRACEPARENT"
+	envTracestate  = "TRACESTATE"
+)
+
+// childEnv returns the child environment for meta: the server's
+// environment with meta's idempotency scope set as
+// [EnvIdempotencyScope], and, when meta carries a trace context, the
+// server's own trace variables replaced by meta's. An inherited
+// scope is always replaced: it belongs to whoever served the server.
+func childEnv(meta Meta) []string {
+	parent := os.Environ()
+	env := make([]string, 0, len(parent)+3)
+	for _, kv := range parent {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == EnvIdempotencyScope {
+			continue
+		}
+		if meta.Traceparent != "" && (name == envTraceparent || name == envTracestate) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, EnvIdempotencyScope+"="+IdempotencyScope(meta))
+	if meta.Traceparent != "" {
+		env = append(env, envTraceparent+"="+meta.Traceparent)
+		if meta.Tracestate != "" {
+			env = append(env, envTracestate+"="+meta.Tracestate)
+		}
+	}
+	return env
+}
+
+// cliError is the conversion interface kit's structured errors
+// satisfy. Depending on the interface rather than the concrete type
+// keeps the runner from caring which package minted the error.
+type cliError interface {
+	AsCLIError() *output.Error
+}
+
+// inProcessExitCode derives the exit code from an error returned by
+// cobra's ExecuteContext.
+//
+// Kit's structured errors carry the verdict: a policy refusal is
+// UNAUTHORIZED (5), a bad request is USAGE (2). Collapsing them all
+// to 1 discards that, which matters most to a transport — a refusal
+// reported as a generic failure reads to a caller as "the server
+// broke" rather than "you were refused". This mirrors what the
+// subprocess runner already does with exitCodeOf.
+//
+// Falls back to 1 when the error carries no code of its own, which is
+// the right answer for a bare errors.New from an adopter command.
+func inProcessExitCode(err error) int {
+	var ce cliError
+	if errors.As(err, &ce) {
+		if e := ce.AsCLIError(); e != nil && e.ExitCode != 0 {
+			return e.ExitCode
+		}
+	}
+	return 1
+}
+
+// exitCodeOf extracts the process exit code from an *exec.ExitError,
+// returning 1 for any other error type (Go's convention for "command
+// failed but no status was reported").
+func exitCodeOf(err error) int {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return 1
+}
