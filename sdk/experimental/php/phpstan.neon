@@ -1,0 +1,30 @@
+# Shipped code is gated at level 5 — the first level that reports argument
+# type mismatches, which is the check most worth having here. src/ passes
+# it clean.
+#
+# tests/ is gated at 2 via a second pass because one helper blocks 3 and
+# up: HttpsSinkTest::clientWith() hands an array by reference to Guzzle's
+# Middleware::history(), whose container is untyped and inferred as
+# array|ArrayAccess<int, array>. By-ref parameters must match the callee
+# exactly, so closing it means widening the helper's own signature to
+# accept an ArrayAccess it is never called with. Fold tests/ back into the
+# level 5 run above once that helper is retyped; nothing else in tests/
+# fails at 5.
+#
+# Level 6 would cost 3 errors in src/ (missing iterable value types).
+#
+# No baseline and no ignore list: every error reported here is a real one.
+#
+# Both passes run with --memory-limit=1G (see composer.json). phpstan
+# inherits php.ini's memory_limit into its parallel workers, and a
+# worker needs ~130 MB for either tree today, so a stock CLI ini
+# (homebrew and distro packages ship 128M) kills the worker and phpstan
+# exits 1 with "Result is incomplete because of severe errors". CI only
+# stayed green because shivammathur/setup-php appends memory_limit=-1 to
+# every php.ini it installs. Pinning the limit in the script makes the
+# gate behave the same everywhere; 1G rather than -1 so a runaway
+# analysis still fails instead of swapping the host.
+parameters:
+    level: 5
+    paths:
+        - src
