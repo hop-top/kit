@@ -1,0 +1,623 @@
+package mcpserve
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/spf13/cobra"
+
+	"hop.top/kit/go/ai/cmdreflect"
+	"hop.top/kit/go/console/cli"
+	"hop.top/kit/go/console/cli/service"
+	"hop.top/kit/go/console/serve"
+	"hop.top/kit/go/transport/api"
+	"hop.top/kit/go/transport/cmdsurface"
+	"hop.top/kit/go/transport/mcpsdk"
+	"hop.top/kit/go/transport/transportsvc"
+)
+
+// ServiceName is the identifier the MCP service registers under. Like
+// [service.APIServiceName] it is a CLI word, a config key segment
+// (services.mcp.*), and a bus payload value at once, so it is stable
+// across releases.
+const ServiceName = "mcp"
+
+// Transports the service speaks, the values of services.mcp.transport
+// and Config.Transport.
+const (
+	// TransportHTTP serves streamable HTTP on the service's own
+	// listener. It is the default.
+	TransportHTTP = "http"
+	// TransportStdio serves the process's standard input and output,
+	// for a host that spawns `<tool> service start mcp --stdio`.
+	TransportStdio = "stdio"
+)
+
+// DefaultAddr is the HTTP listen address when neither Config.Addr,
+// services.mcp.addr, nor --mcp-addr sets one. It is a loopback address
+// for the same reason [service.DefaultAPIAddr] is.
+const DefaultAddr = "127.0.0.1:8081"
+
+// DefaultPath is the HTTP endpoint path when neither Config.Path nor
+// services.mcp.path sets one.
+const DefaultPath = "/mcp"
+
+// Service-owned config keys and flags.
+const (
+	keyPrefix              = "services." + ServiceName
+	subkeyTransport        = ".transport"
+	subkeyAddr             = ".addr"
+	subkeyPath             = ".path"
+	subkeyInsecureRemote   = ".insecure_remote"
+	subkeyInsecureNoPolicy = ".insecure_no_policy"
+
+	// stdioFlag selects the stdio transport for one run.
+	stdioFlag = "stdio"
+	// addrFlag overrides services.mcp.addr for one run.
+	addrFlag = "mcp-addr"
+)
+
+// Config configures the MCP service.
+//
+// The service follows docs/contracts/serve-lifecycle.md §"The mcp
+// service": everything the api and socket services get — the root
+// factory, replayed operator flags, Expose/Hide/Policy, the permission
+// gate, audit sinks, readiness and exit codes — pinned to the mcp
+// surface, with the protocol carried by the official MCP Go SDK.
+type Config struct {
+	// Transport is TransportHTTP (the default) or TransportStdio.
+	// services.mcp.transport overrides it, and --stdio overrides that.
+	Transport string
+
+	// Addr is the HTTP listen address (default [DefaultAddr], a
+	// loopback address). services.mcp.addr overrides it, and
+	// --mcp-addr overrides that. A non-loopback address is refused at
+	// validation unless Auth is set or InsecureRemote opts in, and
+	// refused again unless a --policy is in force or InsecureNoPolicy
+	// opts in — the api service's rules, under this service's names.
+	Addr string
+
+	// Path is the HTTP endpoint path (default [DefaultPath]).
+	// services.mcp.path overrides it. It must begin with "/".
+	Path string
+
+	// Auth authenticates every HTTP request before the MCP layer sees
+	// it; see [api.AuthFunc]. Its claims attribute each call, and it
+	// is what admits a leaf declaring kit/auth-required over HTTP: a
+	// bare Authorization header is not authentication. It does not
+	// apply to stdio, whose peer is the process that spawned the
+	// service.
+	Auth api.AuthFunc
+
+	// InsecureRemote permits serving HTTP WITHOUT authentication on a
+	// non-loopback address. services.mcp.insecure_remote sets the
+	// same thing. There is no flag: the --insecure-remote flag names
+	// the api service.
+	InsecureRemote bool
+
+	// InsecureNoPolicy permits serving HTTP on a non-loopback address
+	// with NO delegation policy in force, rather than kit-default, when
+	// no --policy is named.
+	// services.mcp.insecure_no_policy sets the same thing.
+	InsecureNoPolicy bool
+
+	// Optional makes the service optional by default: when the tool
+	// runs it beside other services, its failure — a taken port, a
+	// missed readiness budget, a crash — is reported but does not
+	// bring them down or change the exit code. It is the default for
+	// services.mcp.optional, which wins when set. See
+	// docs/contracts/serve-lifecycle.md §"Optional services".
+	Optional bool
+
+	// Expose lists the command patterns the service may invoke, in
+	// the pattern language of [cmdsurface.Bridge.Expose]. Empty
+	// exposes the whole tree; the destructive ceiling still applies
+	// on top.
+	Expose []string
+
+	// Hide carves exceptions out of Expose, applied after it.
+	Hide []string
+
+	// Policy gates which commands the service may invoke. The zero
+	// value withholds every destructive command. To permit them over
+	// MCP, name the surface:
+	//
+	//	Policy: cmdsurface.Policy{
+	//		AllowDestructiveOn: []cmdsurface.Surface{cmdsurface.SurfaceMCP},
+	//	}
+	//
+	// Permitting them does not skip the command's own confirmation:
+	// the call still carries its `confirm` argument.
+	Policy cmdsurface.Policy
+
+	// Instructions is offered to connecting clients during
+	// initialization.
+	Instructions string
+
+	// ServerOptions are passed to [mcpsdk.New] before the options the
+	// service sets itself — server identity, provenance, the auth
+	// verdict, elicited confirmation — so those always win. They are
+	// the hook for prompts, resources and the rest of the SDK surface
+	// (mcpsdk.WithServerConfigurator); what they register runs outside
+	// kit's gates, as the mcpsdk package documents.
+	ServerOptions []mcpsdk.Option
+}
+
+// With returns a Root option registering the `mcp` service: the
+// tool's command tree served as MCP tools, one per invocable leaf,
+// over streamable HTTP or stdio.
+//
+// It lives in its own package so that only a tool that serves MCP
+// links the MCP SDK; go/console/cli itself does not depend on it.
+//
+// Like [service.WithSocket], the service is NOT enabled by default. Start
+// it with `<tool> service start mcp` (HTTP) or `<tool> service start mcp --stdio`, or
+// set services.mcp.enabled.
+func With(cfg Config) func(*cli.Root) {
+	return with(cfg, nil)
+}
+
+// with is With with the stdio streams overridable, for tests.
+func with(cfg Config, stdio *stdioStreams) func(*cli.Root) {
+	return func(r *cli.Root) {
+		service.WithService(newService(r, &cfg, stdio))(r)
+		mountServeFlags(r)
+	}
+}
+
+// serveCmd returns kit's `service start`, the command the services'
+// flags go on (the deprecated root `serve` shares them), or nil before
+// one is mounted.
+func serveCmd(r *cli.Root) *cobra.Command {
+	return service.ServeCommand(r)
+}
+
+// mountServeFlags puts --stdio and --mcp-addr on the serve parent, the
+// way --socket reaches the socket service. They are inert unless the
+// mcp service is the one running.
+func mountServeFlags(r *cli.Root) {
+	c := serveCmd(r)
+	if c == nil {
+		return
+	}
+	if c.Flags().Lookup(stdioFlag) == nil {
+		c.Flags().Bool(stdioFlag, false,
+			"Serve the mcp service over standard input and output")
+	}
+	if c.Flags().Lookup(addrFlag) == nil {
+		c.Flags().String(addrFlag, "",
+			"Listen address for the mcp service's HTTP transport")
+	}
+}
+
+// mcpService is the transport service with a class that depends on the
+// transport resolved for the run: a listener over HTTP, no network at
+// all over stdio.
+type mcpService struct {
+	*transportsvc.TransportService
+	root  *cli.Root
+	cfg   *Config
+	stdio *stdioStreams
+	// tls is the HTTP listener's resolved services.mcp.tls and
+	// auth.mode, set by validate and again at bind.
+	tls *service.ServeTLS
+}
+
+// auth is the verifier every HTTP request passes: the one
+// services.mcp.auth.mode selects (mtls, jwt, jwks, oidc), else
+// Config.Auth.
+func (s *mcpService) auth() api.AuthFunc {
+	if f := s.tls.Auth(); f != nil {
+		return f
+	}
+	return s.cfg.Auth
+}
+
+// resolveTLS resolves services.mcp.tls and auth.mode into s.tls.
+func (s *mcpService) resolveTLS() error {
+	t, err := service.ResolveServeTLS(s.root, ServiceName)
+	if err != nil {
+		return err
+	}
+	s.tls = t
+	return nil
+}
+
+// Class implements [serve.Classified].
+func (s *mcpService) Class() (sideEffect, network string) {
+	if s.transport() == TransportStdio {
+		return string(cli.SideEffectWriteShared), "none"
+	}
+	return string(cli.SideEffectWriteShared), "listen"
+}
+
+// Optional implements [serve.Optional]: Config.Optional is the
+// registration's default, and services.mcp.optional overrides it.
+func (s *mcpService) Optional() bool { return s.cfg.Optional }
+
+var (
+	_ serve.Service    = (*mcpService)(nil)
+	_ serve.Validator  = (*mcpService)(nil)
+	_ serve.Addressed  = (*mcpService)(nil)
+	_ serve.Classified = (*mcpService)(nil)
+	_ serve.Optional   = (*mcpService)(nil)
+)
+
+// newService builds the service on the transport seam, with the
+// bridge wiring every kit-shipped service gets: the adopter's Policy,
+// then [service.ServeBridgeOptions] — the root factory's runner, the
+// shared permission gate and audit sinks — resolved while preparing.
+func newService(root *cli.Root, cfg *Config, stdio *stdioStreams) *mcpService {
+	s := &mcpService{root: root, cfg: cfg, stdio: stdio}
+	tr := &transport{svc: s}
+
+	opts := []transportsvc.TransportOption{
+		transportsvc.Expose("*"),
+		transportsvc.WithBridgeOptions(cmdsurface.WithPolicy(cfg.Policy)),
+		transportsvc.WithBridgeOptionsFunc(func() []cmdsurface.Option {
+			// On error these refuse every call. Validate has already
+			// refused the configuration that errs here, so this is
+			// unreachable in practice.
+			// stdio is reachable only by the process that spawned it.
+			loopback := s.transport() == TransportStdio || service.IsLoopbackAddr(s.addr())
+			shared, _ := service.ServeBridgeOptionsExposed(root, ServiceName, service.ServeExposure{
+				Loopback:         loopback,
+				InsecureNoPolicy: s.optIn(subkeyInsecureNoPolicy, s.cfg.InsecureNoPolicy),
+			})
+			return shared
+		}),
+		transportsvc.WithValidate(s.validate),
+	}
+	if len(cfg.Expose) > 0 {
+		// A non-empty Expose narrows the whole-tree default: hide
+		// everything, then expose what was named.
+		opts = append(opts, transportsvc.Hide("*"))
+	}
+	for _, p := range cfg.Expose {
+		opts = append(opts, transportsvc.Expose(p))
+	}
+	for _, p := range cfg.Hide {
+		opts = append(opts, transportsvc.Hide(p))
+	}
+
+	s.TransportService = transportsvc.NewTransportService(
+		ServiceName, root.Cmd, cmdsurface.SurfaceMCP, tr, opts...,
+	)
+	return s
+}
+
+// flag returns this run's value of a serve flag and whether the
+// operator set it. Flags are read from the parsed serve command at
+// use, so a re-executed root never inherits a previous run's value.
+func (s *mcpService) flag(name string) (string, bool) {
+	c := serveCmd(s.root)
+	if c == nil {
+		return "", false
+	}
+	f := c.Flags().Lookup(name)
+	if f == nil || !f.Changed {
+		return "", false
+	}
+	return f.Value.String(), true
+}
+
+// transport resolves the transport for this run: --stdio, then
+// services.mcp.transport, then Config.Transport, then http.
+func (s *mcpService) transport() string {
+	if v, set := s.flag(stdioFlag); set && v == "true" {
+		return TransportStdio
+	}
+	if s.root.Viper != nil {
+		if v := s.root.Viper.GetString(keyPrefix + subkeyTransport); v != "" {
+			return strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	if s.cfg.Transport != "" {
+		return strings.ToLower(strings.TrimSpace(s.cfg.Transport))
+	}
+	return TransportHTTP
+}
+
+// addr resolves the HTTP listen address: --mcp-addr, then
+// services.mcp.addr, then Config.Addr, then [DefaultAddr].
+func (s *mcpService) addr() string {
+	if v, set := s.flag(addrFlag); set && v != "" {
+		return v
+	}
+	if s.root.Viper != nil {
+		if v := s.root.Viper.GetString(keyPrefix + subkeyAddr); v != "" {
+			return v
+		}
+	}
+	if s.cfg.Addr != "" {
+		return s.cfg.Addr
+	}
+	return DefaultAddr
+}
+
+// path resolves the HTTP endpoint path: services.mcp.path, then
+// Config.Path, then [DefaultPath].
+func (s *mcpService) path() string {
+	if s.root.Viper != nil {
+		if v := s.root.Viper.GetString(keyPrefix + subkeyPath); v != "" {
+			return v
+		}
+	}
+	if s.cfg.Path != "" {
+		return s.cfg.Path
+	}
+	return DefaultPath
+}
+
+// optIn resolves a boolean opt-in: the config key when set, else the
+// code value. There is no flag layer.
+func (s *mcpService) optIn(subkey string, code bool) bool {
+	if s.root.Viper != nil {
+		key := keyPrefix + subkey
+		if s.root.Viper.IsSet(key) {
+			return s.root.Viper.GetBool(key)
+		}
+	}
+	return code
+}
+
+// validate is the service's configuration gate (serve-lifecycle.md §"The
+// override rule"): every refusal here is a usage error at exit 2,
+// before anything binds.
+func (s *mcpService) validate() error {
+	switch transport := s.transport(); transport {
+	case TransportStdio:
+		if _, set := s.flag(addrFlag); set {
+			return errors.New(
+				"addr: --mcp-addr applies to the http transport, and --stdio selects stdio; drop one of them",
+			)
+		}
+	case TransportHTTP:
+		if err := s.validateHTTP(); err != nil {
+			return err
+		}
+		// The HTTP-plane blocks under services.mcp (and services.all):
+		// the stdio transport has no HTTP plane, so they are read, and
+		// checked, on this transport only.
+		if err := service.ValidateServeHTTPListener(s.root, s.httpListener()); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("transport: unknown transport %q; use %q or %q",
+			transport, TransportHTTP, TransportStdio)
+	}
+	return service.ValidateServeBridge(s.root, ServiceName)
+}
+
+// validateHTTP checks the address and path, then applies the api
+// service's two exposure refusals under this service's names.
+func (s *mcpService) validateHTTP() error {
+	addr := s.addr()
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return fmt.Errorf("addr: %w", err)
+	}
+	if p := s.path(); !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("path: %q must begin with \"/\"", p)
+	}
+	if err := s.resolveTLS(); err != nil {
+		return err
+	}
+	if service.IsLoopbackAddr(addr) {
+		return nil
+	}
+	if s.auth() == nil && !s.optIn(subkeyInsecureRemote, s.cfg.InsecureRemote) {
+		return fmt.Errorf(
+			"addr: %q is not a loopback address and the mcp service has no authentication; "+
+				"set services.mcp.auth.mode or mcpserve.Config.Auth, listen on 127.0.0.1, or set services.mcp.insecure_remote: true "+
+				"to serve unauthenticated beyond loopback",
+			addr,
+		)
+	}
+	return nil
+}
+
+// httpListener describes the HTTP transport's listener to the
+// HTTP-plane chain kit's listeners share: its blocks are
+// services.mcp.*, its readiness the service's, and its refusals
+// JSON-RPC error bodies.
+func (s *mcpService) httpListener() service.ServeHTTPListener {
+	return service.ServeHTTPListener{
+		Service: ServiceName,
+		Addr:    s.addr(),
+		Ready:   s.Ready,
+		Refuse:  mcpsdk.RefuseJSONRPC,
+		CORS:    mcpCORS,
+	}
+}
+
+// mcpCORS is what a browser client of the streamable HTTP transport
+// needs from the cors block: POST for messages, GET for the event
+// stream, DELETE to end a session; the session, protocol-version and
+// routing headers it sends; and the session id it must read to send
+// the next request. A tool whose input schema binds a parameter to a
+// header (x-mcp-header) adds its Mcp-Param-* header to allow_headers.
+var mcpCORS = service.ServeCORS{
+	Methods: []string{http.MethodGet, http.MethodPost, http.MethodDelete},
+	AllowHeaders: []string{
+		"Mcp-Session-Id", "Mcp-Protocol-Version", "Mcp-Method", "Mcp-Name", "Last-Event-ID",
+	},
+	ExposeHeaders: []string{"Mcp-Session-Id", "Mcp-Protocol-Version"},
+}
+
+// mcpServing is one transport's half of a run: build what serving the
+// surface needs, acquire, serve, release.
+type mcpServing interface {
+	// prepare builds, from the surface, the tree and the
+	// configuration, everything bind and serve use; it runs in the
+	// prepare phase and acquires nothing.
+	prepare(s *mcpsdk.Surface) error
+	bind(ctx context.Context) (addr string, err error)
+	serve(ctx context.Context) error
+	close(ctx context.Context) error
+}
+
+// transport is the [transportsvc.Transport] behind the service. It
+// resolves the transport and builds the SDK surface over the bridge
+// the seam reflected while preparing, so flags parsed after
+// construction win, and nothing reads the tree once calls are served.
+type transport struct {
+	svc *mcpService
+
+	mu   sync.Mutex
+	impl mcpServing
+}
+
+var _ transportsvc.Preparer = (*transport)(nil)
+
+// Prepare resolves the transport, builds the SDK surface over b — the
+// catalog narrowed, every tool's schema collected from its flags — and
+// what the transport serves it with. It runs in the supervisor's
+// prepare phase, before any service serves a call.
+func (t *transport) Prepare(ctx context.Context, b *cmdsurface.Bridge) error {
+	var impl mcpServing
+	switch t.svc.transport() {
+	case TransportStdio:
+		impl = newStdio(t.svc.stdio)
+	default:
+		impl = newHTTP(t.svc)
+	}
+	s, err := t.surface(ctx, impl, b)
+	if err != nil {
+		return err
+	}
+	if err := impl.prepare(s); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.impl = impl
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *transport) Bind(ctx context.Context) (string, error) {
+	t.mu.Lock()
+	impl := t.impl
+	t.mu.Unlock()
+	if impl == nil {
+		return "", errors.New("mcp: Bind called before Prepare")
+	}
+	return impl.bind(ctx)
+}
+
+func (t *transport) Serve(ctx context.Context, _ transportsvc.Invoker) error {
+	t.mu.Lock()
+	impl := t.impl
+	t.mu.Unlock()
+	if impl == nil {
+		return errors.New("mcp: Serve called before Bind")
+	}
+	return impl.serve(ctx)
+}
+
+func (t *transport) Close(ctx context.Context) error {
+	t.mu.Lock()
+	impl := t.impl
+	t.mu.Unlock()
+	if impl == nil {
+		return nil
+	}
+	return impl.close(ctx)
+}
+
+// surface builds the SDK surface over the service's bridge. Every
+// call is admitted by Bridge.Admit before it runs, so the policy,
+// invocability and permission gates the seam promises hold on both
+// transports.
+func (t *transport) surface(ctx context.Context, impl mcpServing, b *cmdsurface.Bridge) (*mcpsdk.Surface, error) {
+	withholdFromCatalog(ctx, b, t.svc.root)
+
+	cfg := t.svc.cfg
+	opts := append([]mcpsdk.Option(nil), cfg.ServerOptions...)
+	name, version := t.svc.root.Config.Name, t.svc.root.Config.Version
+	if name == "" {
+		name = "kit"
+	}
+	if version == "" {
+		version = "0.0.0"
+	}
+	opts = append(opts, mcpsdk.WithServerInfo(name, version))
+	if cfg.Instructions != "" {
+		opts = append(opts, mcpsdk.WithInstructions(cfg.Instructions))
+	}
+	gates, ok := impl.(interface {
+		callMeta(context.Context, *mcp.CallToolRequest) cmdsurface.Meta
+		authenticated(context.Context, *mcp.CallToolRequest) bool
+	})
+	if ok {
+		opts = append(opts,
+			mcpsdk.WithCallMeta(gates.callMeta),
+			mcpsdk.WithAuthenticated(gates.authenticated),
+		)
+	}
+	opts = append(opts, mcpsdk.WithConfirmationElicitation(nil))
+	if h, ok := impl.(interface {
+		surfaceOptions() ([]mcpsdk.Option, error)
+	}); ok {
+		more, err := h.surfaceOptions()
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, more...)
+	}
+	return mcpsdk.New(b, opts...)
+}
+
+// withholdFromCatalog takes off the tool list exactly what the REST
+// projection withholds at mount: every command the reflector judges
+// non-invocable for a served surface — interactive, management-only,
+// self-hosting — under the same reflection REST uses (the Root's
+// reserved verbs, no Allow* options), then destructive leaves the
+// policy refuses on mcp, and leaves the permission gate refuses for
+// every caller. The list is advisory — a call still meets every gate —
+// but a model reads it before it calls anything, and a tool that can
+// only ever refuse is noise it will act on.
+//
+// The bridge itself reflects more permissively (it describes reserved
+// verbs as leaves, the way the socket service reaches them); the
+// catalog is where the MCP surface narrows to REST's set.
+func withholdFromCatalog(ctx context.Context, b *cmdsurface.Bridge, root *cli.Root) {
+	served := cmdreflect.Reflect(root.Cmd, cmdreflect.WithReserved(root))
+	for _, leaf := range b.Leaves() {
+		if !leaf.Enabled[cmdsurface.SurfaceMCP] {
+			continue
+		}
+		if catalogWithholds(ctx, b, served, leaf) {
+			b.Hide(leaf.PathKey(), cmdsurface.SurfaceMCP)
+		}
+	}
+}
+
+func catalogWithholds(ctx context.Context, b *cmdsurface.Bridge, served *cmdreflect.Tree, leaf *cmdsurface.Leaf) bool {
+	if d := served.Lookup(leaf.PathKey()); d == nil || !d.Invocable {
+		return true
+	}
+	if !b.Policy().Allowed(leaf.Class, cmdsurface.SurfaceMCP) {
+		return true
+	}
+	dec := b.Permission(ctx, cmdsurface.Meta{Surface: cmdsurface.SurfaceMCP}, leaf)
+	return !dec.Allowed && dec.CallerIndependent
+}
+
+// clientName is the client's self-reported name from the MCP
+// handshake: provenance, never a credential.
+func clientName(req *mcp.CallToolRequest) string {
+	if req == nil || req.Session == nil {
+		return ""
+	}
+	p := req.Session.InitializeParams()
+	if p == nil || p.ClientInfo == nil {
+		return ""
+	}
+	return p.ClientInfo.Name
+}

@@ -1,0 +1,69 @@
+name: CI (PHP)
+
+on:
+  push:
+    branches: [main]
+    paths: ["**.php", "composer.json", "composer.lock", "phpstan.neon", "phpunit.xml"]
+  pull_request:
+    branches: [main]
+    paths: ["**.php", "composer.json", "composer.lock", "phpstan.neon", "phpunit.xml"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # PHP comes from setup-php, not mise (mise builds PHP from
+      # source); ubuntu-latest ships an older PHP than composer.json's
+      # floor. Keep php-version equal to that floor.
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.4'
+          tools: composer
+
+      # >>> kit-managed: toolchain >>>
+      - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        with:
+          install: true
+          cache: true
+      - run: mise run install
+      # <<< kit-managed: toolchain <<<
+
+      - name: composer install
+        run: mise exec -- make setup
+
+      - name: phpstan
+        run: mise exec -- make lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # PHP comes from setup-php, not mise (mise builds PHP from
+      # source); ubuntu-latest ships an older PHP than composer.json's
+      # floor. Keep php-version equal to that floor.
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.4'
+          tools: composer
+
+      # >>> kit-managed: toolchain >>>
+      - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        with:
+          install: true
+          cache: true
+      - run: mise run install
+      # <<< kit-managed: toolchain <<<
+
+      - name: composer install
+        run: mise exec -- make setup
+
+      - name: phpunit
+        run: mise exec -- make test

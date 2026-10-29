@@ -1,0 +1,953 @@
+// Package google implements the Google Gemini LLM adapter using a thin
+// HTTP client that speaks the Gemini REST API directly.
+//
+// Schemes: gemini, google
+// Default base URL: https://generativelanguage.googleapis.com/v1beta
+// Implements: [llm.Provider], [llm.Completer], [llm.Streamer],
+// [llm.ToolCaller], [llm.ToolStreamer]
+//
+// # Thought signatures
+//
+// Gemini thinking models attach an opaque thoughtSignature to the first
+// functionCall part of each step and reject (400) a tool loop whose
+// current turn replays a call without it. The adapter keeps it in
+// [llm.ToolCall.ProviderData] under the "google" key as
+// {"thought_signature": "<sig>"} (the shape Gemini's OpenAI-compatible
+// API uses in extra_content.google) and sends it back on the same
+// functionCall part. Replay [llm.ToolResponse.ToolCalls] verbatim to keep
+// it.
+//
+// A current-turn step with no signed call (history built by hand or by
+// another provider) gets Gemini's documented skip value
+// "skip_thought_signature_validator" on its first functionCall part, so
+// the request is accepted; Google notes this costs reasoning quality.
+// Earlier turns are not validated and go out as given. Signatures Gemini
+// puts on text parts are optional to return and are not kept.
+package google
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"hop.top/kit/go/ai/llm"
+	llmerrors "hop.top/kit/go/ai/llm/errors"
+)
+
+const (
+	defaultBaseURL = "https://generativelanguage.googleapis.com/v1beta"
+)
+
+// Compile-time interface checks.
+var (
+	_ llm.Provider   = (*Adapter)(nil)
+	_ llm.Completer  = (*Adapter)(nil)
+	_ llm.Streamer   = (*Adapter)(nil)
+	_ llm.ToolCaller = (*Adapter)(nil)
+)
+
+// Adapter is the Google Gemini provider. It implements [llm.Provider],
+// [llm.Completer], [llm.Streamer], [llm.ToolCaller] and
+// [llm.ToolStreamer].
+type Adapter struct {
+	baseURL string
+	model   string
+	apiKey  string
+	client  *http.Client
+	// toolNames is the tool_names param: how tool names the API
+	// rejects are handled.
+	toolNames llm.ToolNameMode
+}
+
+// New creates a new Google Gemini adapter from resolved config.
+// It is a valid [llm.Factory].
+func New(cfg llm.ResolvedConfig) (llm.Provider, error) {
+	base := cfg.Provider.BaseURL
+	if base == "" {
+		base = defaultBaseURL
+	}
+	base = strings.TrimRight(base, "/")
+
+	model := cfg.Provider.Model
+	if model == "" {
+		return nil, fmt.Errorf("gemini: model is required")
+	}
+
+	// Env order comes from this adapter's declaration: GOOGLE_API_KEY,
+	// GEMINI_API_KEY, then LLM_API_KEY, as Google's genai SDK reads them.
+	apiKey := cfg.Provider.APIKey
+	if strings.TrimSpace(apiKey) == "" {
+		apiKey, _ = llm.SecretFor(context.Background(), nil, "google")
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf(
+			"gemini: API key is required (set via config, URI param, " +
+				"GOOGLE_API_KEY, GEMINI_API_KEY, or LLM_API_KEY)",
+		)
+	}
+
+	toolNames, err := llm.ToolNameModeOf(cfg.Provider.Params)
+	if err != nil {
+		return nil, fmt.Errorf("gemini: %w", err)
+	}
+
+	return &Adapter{
+		baseURL:   base,
+		model:     model,
+		apiKey:    apiKey,
+		client:    http.DefaultClient,
+		toolNames: toolNames,
+	}, nil
+}
+
+// Close is a no-op; the adapter uses a shared HTTP client.
+func (a *Adapter) Close() error { return nil }
+
+func (a *Adapter) effectiveModel(req llm.Request) string {
+	if req.Model != "" {
+		return req.Model
+	}
+	return a.model
+}
+
+// ---------------------------------------------------------------------------
+// Gemini API types
+// ---------------------------------------------------------------------------
+
+type generateRequest struct {
+	Contents          []content         `json:"contents"`
+	SystemInstruction *content          `json:"systemInstruction,omitempty"`
+	GenerationConfig  *generationConfig `json:"generationConfig,omitempty"`
+	Tools             []toolDecl        `json:"tools,omitempty"`
+	ToolConfig        *toolConfig       `json:"toolConfig,omitempty"`
+}
+
+// toolConfig carries the request's tool choice.
+type toolConfig struct {
+	FunctionCallingConfig functionCallingConfig `json:"functionCallingConfig"`
+}
+
+type functionCallingConfig struct {
+	Mode                 string   `json:"mode"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
+}
+
+type content struct {
+	Role  string `json:"role"`
+	Parts []part `json:"parts"`
+}
+
+type part struct {
+	Text       string      `json:"text,omitempty"`
+	InlineData *inlineData `json:"inlineData,omitempty"`
+
+	// Tool-related fields.
+	FunctionCall     *functionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *functionResponse `json:"functionResponse,omitempty"`
+
+	// ThoughtSignature is opaque and must return on the same part.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
+}
+
+// providerDataKey namespaces this adapter's [llm.ProviderData].
+const providerDataKey = "google"
+
+// skipThoughtSignature is Gemini's documented stand-in for a
+// functionCall part that has no signature of its own.
+const skipThoughtSignature = "skip_thought_signature_validator"
+
+// providerData is the JSON under providerDataKey.
+type providerData struct {
+	ThoughtSignature string `json:"thought_signature,omitempty"`
+}
+
+type inlineData struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+// functionCall.ID is read from responses only. Requests leave it empty:
+// Gemini pairs a functionResponse with its call by name and order, and
+// the ID kit holds may be one it synthesized.
+type functionCall struct {
+	ID   string          `json:"id,omitempty"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
+}
+
+type functionResponse struct {
+	Name     string          `json:"name"`
+	Response json.RawMessage `json:"response"`
+}
+
+type generationConfig struct {
+	Temperature   *float64 `json:"temperature,omitempty"`
+	MaxTokens     *int     `json:"maxOutputTokens,omitempty"`
+	StopSequences []string `json:"stopSequences,omitempty"`
+}
+
+type toolDecl struct {
+	FunctionDeclarations []functionDecl `json:"functionDeclarations"`
+}
+
+type functionDecl struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type generateResponse struct {
+	Candidates     []candidate     `json:"candidates"`
+	PromptFeedback *promptFeedback `json:"promptFeedback,omitempty"`
+	UsageMetadata  *usageMetadata  `json:"usageMetadata,omitempty"`
+	Error          *apiError       `json:"error,omitempty"`
+}
+
+// promptFeedback is set, without candidates, on a blocked prompt.
+type promptFeedback struct {
+	BlockReason string `json:"blockReason,omitempty"`
+}
+
+type candidate struct {
+	Content      content `json:"content"`
+	FinishReason string  `json:"finishReason,omitempty"`
+}
+
+type usageMetadata struct {
+	PromptTokenCount     int `json:"promptTokenCount"`
+	CandidatesTokenCount int `json:"candidatesTokenCount"`
+	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
+type apiError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
+}
+
+// newRequest builds a POST to the model's method. The key travels in
+// the x-goog-api-key header, as Google's genai SDK sends it, and never
+// in the URL: net/http quotes the URL in every transport error, and the
+// --offline guard names it in its refusal.
+func (a *Adapter) newRequest(
+	ctx context.Context, model, method string, body []byte,
+) (*http.Request, error) {
+	url := fmt.Sprintf("%s/models/%s:%s", a.baseURL, model, method)
+	httpReq, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, url, bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, llm.RedactURLError(err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", a.apiKey)
+	return httpReq, nil
+}
+
+// ---------------------------------------------------------------------------
+// Completer
+// ---------------------------------------------------------------------------
+
+// Complete sends a non-streaming generateContent request.
+func (a *Adapter) Complete(
+	ctx context.Context, req llm.Request,
+) (llm.Response, error) {
+	model := a.effectiveModel(req)
+	body, _, err := a.buildBody(ctx, req, nil)
+	if err != nil {
+		return llm.Response{}, err
+	}
+
+	httpReq, err := a.newRequest(ctx, model, "generateContent", body)
+	if err != nil {
+		return llm.Response{}, err
+	}
+
+	resp, err := a.client.Do(httpReq)
+	if err != nil {
+		return llm.Response{}, llm.RedactURLError(err)
+	}
+	defer resp.Body.Close()
+
+	if err := a.checkStatus(resp, model); err != nil {
+		return llm.Response{}, err
+	}
+
+	var gr generateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
+		return llm.Response{}, fmt.Errorf("gemini: decode response: %w", err)
+	}
+
+	if gr.Error != nil {
+		return llm.Response{}, a.mapAPIError(gr.Error, model)
+	}
+
+	return a.parseResponse(gr), nil
+}
+
+// ---------------------------------------------------------------------------
+// Streamer
+// ---------------------------------------------------------------------------
+
+// Stream sends a streaming generateContent request and returns a
+// [llm.TokenIterator]. With [llm.Request.StreamEvents] it streams as
+// [Adapter.StreamWithTools] does without tools: usage snapshots, and a
+// body ending before a finish reason is truncated.
+func (a *Adapter) Stream(
+	ctx context.Context, req llm.Request,
+) (llm.TokenIterator, error) {
+	if req.StreamEvents {
+		return a.openToolStream(ctx, req, nil)
+	}
+	model := a.effectiveModel(req)
+	body, _, err := a.buildBody(ctx, req, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	rc, err := a.openSSE(ctx, model, body)
+	if err != nil {
+		return nil, err
+	}
+
+	return &streamIterator{
+		scanner: newSSEScanner(rc),
+		body:    rc,
+		model:   model,
+	}, nil
+}
+
+// streamIterator reads SSE lines from a streaming response.
+type streamIterator struct {
+	scanner *bufio.Scanner
+	body    io.ReadCloser
+	model   string
+	done    bool
+}
+
+// Next reads the next token from the stream.
+func (s *streamIterator) Next() (llm.Token, error) {
+	if s.done {
+		return llm.Token{}, io.EOF
+	}
+
+	for s.scanner.Scan() {
+		line := s.scanner.Text()
+
+		// SSE format: "data: {json}"
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "" {
+			continue
+		}
+
+		var gr generateResponse
+		if err := json.Unmarshal([]byte(data), &gr); err != nil {
+			return llm.Token{}, fmt.Errorf(
+				"gemini: decode stream chunk: %w", err,
+			)
+		}
+
+		if gr.Error != nil {
+			s.done = true
+			return llm.Token{}, mapStreamError(gr.Error, s.model)
+		}
+
+		text := extractText(gr)
+		finish := extractFinishReason(gr)
+
+		if finish == "STOP" || finish == "MAX_TOKENS" {
+			s.done = true
+			return llm.Token{Content: text, Done: true}, nil
+		}
+
+		if text != "" {
+			return llm.Token{Content: text}, nil
+		}
+	}
+
+	if err := s.scanner.Err(); err != nil {
+		s.done = true
+		return llm.Token{}, fmt.Errorf("gemini: stream read: %w", err)
+	}
+
+	// Stream ended without explicit STOP.
+	s.done = true
+	return llm.Token{Done: true}, nil
+}
+
+// Close releases the underlying response body.
+func (s *streamIterator) Close() error {
+	return s.body.Close()
+}
+
+// ---------------------------------------------------------------------------
+// ToolCaller
+// ---------------------------------------------------------------------------
+
+// CallWithTools sends a generateContent request with tool declarations.
+func (a *Adapter) CallWithTools(
+	ctx context.Context, req llm.Request, tools []llm.ToolDef,
+) (llm.ToolResponse, error) {
+	model := a.effectiveModel(req)
+	body, names, err := a.buildBody(ctx, req, tools)
+	if err != nil {
+		return llm.ToolResponse{}, err
+	}
+
+	httpReq, err := a.newRequest(ctx, model, "generateContent", body)
+	if err != nil {
+		return llm.ToolResponse{}, err
+	}
+
+	resp, err := a.client.Do(httpReq)
+	if err != nil {
+		return llm.ToolResponse{}, llm.RedactURLError(err)
+	}
+	defer resp.Body.Close()
+
+	if err := a.checkStatus(resp, model); err != nil {
+		return llm.ToolResponse{}, err
+	}
+
+	var gr generateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
+		return llm.ToolResponse{}, fmt.Errorf(
+			"gemini: decode response: %w", err,
+		)
+	}
+
+	if gr.Error != nil {
+		return llm.ToolResponse{}, a.mapAPIError(gr.Error, model)
+	}
+
+	return a.parseToolResponse(gr, names), nil
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// buildBody maps req and tools to a generateContent body. Tool names,
+// in declarations and replayed history alike, go out as names maps
+// them; see [llm.NewToolNames].
+func (a *Adapter) buildBody(
+	ctx context.Context, req llm.Request, tools []llm.ToolDef,
+) ([]byte, *llm.ToolNames, error) {
+	names, err := llm.NewToolNames(llm.GeminiToolNames, a.toolNames, tools)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := llm.CheckToolChoice(req.ToolChoice, tools); err != nil {
+		return nil, nil, fmt.Errorf("gemini: %w", err)
+	}
+	contents := make([]content, 0, len(req.Messages))
+	var systemParts []part
+	// callNames resolves a tool result's ToolCallID to the function
+	// name Gemini needs on the functionResponse.
+	callNames := map[string]string{}
+	turn := currentTurnStart(req.Messages)
+	for i, m := range req.Messages {
+		if m.Role == "system" {
+			systemParts = append(systemParts, part{Text: m.Content})
+			continue
+		}
+		if m.Role == "tool" {
+			p, err := functionResponsePart(m, callNames, names)
+			if err != nil {
+				return nil, nil, err
+			}
+			// Consecutive results answer one model turn and belong in
+			// a single content.
+			if i > 0 && req.Messages[i-1].Role == "tool" {
+				last := &contents[len(contents)-1]
+				last.Parts = append(last.Parts, p)
+				continue
+			}
+			contents = append(contents, content{Role: "user", Parts: []part{p}})
+			continue
+		}
+		c, err := mapMessage(ctx, m, i >= turn, names)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, tc := range m.ToolCalls {
+			callNames[tc.ID] = tc.Name
+		}
+		contents = append(contents, c)
+	}
+
+	gr := generateRequest{Contents: contents}
+	if len(systemParts) > 0 {
+		gr.SystemInstruction = &content{
+			Role:  "user",
+			Parts: systemParts,
+		}
+	}
+
+	// Generation config.
+	var gc generationConfig
+	hasConfig := false
+	if req.Temperature != nil {
+		t := *req.Temperature
+		gc.Temperature = &t
+		hasConfig = true
+	}
+	if req.MaxTokens > 0 {
+		mt := req.MaxTokens
+		gc.MaxTokens = &mt
+		hasConfig = true
+	}
+	if len(req.StopSequences) > 0 {
+		gc.StopSequences = req.StopSequences
+		hasConfig = true
+	}
+	if hasConfig {
+		gr.GenerationConfig = &gc
+	}
+
+	// Tools.
+	if len(tools) > 0 {
+		decls := make([]functionDecl, 0, len(tools))
+		for _, t := range tools {
+			decls = append(decls, functionDecl{
+				Name:        names.Wire(t.Name),
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			})
+		}
+		gr.Tools = []toolDecl{{FunctionDeclarations: decls}}
+	}
+	if c := req.ToolChoice; c != nil {
+		gr.ToolConfig = toolChoice(c, names)
+	}
+
+	out, err := json.Marshal(gr)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, names, nil
+}
+
+// mapMessage converts an llm.Message to a Gemini content object.
+// Gemini uses "user" and "model" roles; "assistant" is mapped to "model".
+//
+// An assistant turn with ToolCalls gets one functionCall part per call
+// after its text (or Parts); an empty Content adds no text part. Each
+// call's thought signature goes back on its own part. In the current
+// turn, a step without any signed call gets the skip value on its first
+// call, the only one Gemini validates.
+func mapMessage(ctx context.Context, m llm.Message, currentTurn bool, names *llm.ToolNames) (content, error) {
+	if m.ToolCallID != "" {
+		return content{}, fmt.Errorf("gemini: ToolCallID is valid only on role tool, got %q", m.Role)
+	}
+	if len(m.ToolCalls) > 0 && m.Role != "assistant" {
+		return content{}, fmt.Errorf("gemini: ToolCalls are valid only on role assistant, got %q", m.Role)
+	}
+
+	c, err := mapContent(ctx, m)
+	if err != nil || len(m.ToolCalls) == 0 {
+		return c, err
+	}
+
+	if len(m.Parts) == 0 && m.Content == "" {
+		c.Parts = nil
+	}
+	first := len(c.Parts)
+	signed := false
+	for _, tc := range m.ToolCalls {
+		args := json.RawMessage(`{}`)
+		if len(tc.Arguments) > 0 {
+			if !json.Valid(tc.Arguments) {
+				return content{}, fmt.Errorf("gemini: tool call %q arguments are not valid JSON", tc.ID)
+			}
+			args = tc.Arguments
+		}
+		sig, err := thoughtSignature(tc)
+		if err != nil {
+			return content{}, err
+		}
+		signed = signed || sig != ""
+		c.Parts = append(c.Parts, part{
+			FunctionCall:     &functionCall{Name: names.Wire(tc.Name), Args: args},
+			ThoughtSignature: sig,
+		})
+	}
+	if currentTurn && !signed {
+		c.Parts[first].ThoughtSignature = skipThoughtSignature
+	}
+	return c, nil
+}
+
+// currentTurnStart returns the index of the last user message: Gemini's
+// turn begins at the most recent user message that is not a
+// functionResponse, and only that turn's signatures are validated.
+func currentTurnStart(msgs []llm.Message) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return i
+		}
+	}
+	return 0
+}
+
+// thoughtSignature reads this adapter's signature from a call's
+// ProviderData; other namespaces are ignored.
+func thoughtSignature(tc llm.ToolCall) (string, error) {
+	raw, ok := tc.ProviderData[providerDataKey]
+	if !ok {
+		return "", nil
+	}
+	var d providerData
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return "", fmt.Errorf("gemini: tool call %q provider data: %w", tc.ID, err)
+	}
+	return d.ThoughtSignature, nil
+}
+
+// signatureData wraps a thought signature as [llm.ProviderData]; nil
+// when the part carried none.
+func signatureData(sig string) llm.ProviderData {
+	if sig == "" {
+		return nil
+	}
+	raw, err := json.Marshal(providerData{ThoughtSignature: sig})
+	if err != nil {
+		return nil
+	}
+	return llm.ProviderData{providerDataKey: raw}
+}
+
+// functionResponsePart maps a role "tool" message to a functionResponse
+// part. Gemini names the function rather than the call, so the name is
+// resolved from the earlier call whose ID matches ToolCallID. A result
+// that is a JSON object is sent as the response struct; anything else
+// is wrapped as {"output": Content}.
+func functionResponsePart(m llm.Message, callNames map[string]string, names *llm.ToolNames) (part, error) {
+	if m.ToolCallID == "" {
+		return part{}, fmt.Errorf("gemini: tool result needs ToolCallID")
+	}
+	if len(m.ToolCalls) > 0 || len(m.Parts) > 0 {
+		return part{}, fmt.Errorf("gemini: tool result %q carries only Content", m.ToolCallID)
+	}
+	name, ok := callNames[m.ToolCallID]
+	if !ok {
+		return part{}, fmt.Errorf(
+			"gemini: tool result %q matches no earlier assistant tool call", m.ToolCallID,
+		)
+	}
+
+	resp := json.RawMessage(m.Content)
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(resp, &obj) != nil || obj == nil {
+		wrapped, err := json.Marshal(map[string]string{"output": m.Content})
+		if err != nil {
+			return part{}, fmt.Errorf("gemini: encode tool result: %w", err)
+		}
+		resp = wrapped
+	}
+	return part{FunctionResponse: &functionResponse{Name: names.Wire(name), Response: resp}}, nil
+}
+
+// mapContent maps a message's role and text or Parts.
+func mapContent(ctx context.Context, m llm.Message) (content, error) {
+	role := m.Role
+	if role == "assistant" {
+		role = "model"
+	}
+
+	if len(m.Parts) == 0 {
+		return content{
+			Role:  role,
+			Parts: []part{{Text: m.Content}},
+		}, nil
+	}
+
+	parts := make([]part, 0, len(m.Parts))
+	for _, p := range m.Parts {
+		switch p.Type {
+		case llm.PartTypeText:
+			parts = append(parts, part{Text: p.Text})
+
+		case llm.PartTypeImage:
+			if p.Source == nil {
+				return content{}, fmt.Errorf(
+					"gemini: image part has nil source",
+				)
+			}
+			rc, err := p.Source.Reader(ctx)
+			if err != nil {
+				return content{}, fmt.Errorf(
+					"gemini: read image: %w", err,
+				)
+			}
+			raw, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				return content{}, fmt.Errorf(
+					"gemini: read image bytes: %w", err,
+				)
+			}
+			mimeType := p.MimeType
+			if mimeType == "" && p.Source != nil {
+				mimeType = p.Source.MimeType()
+			}
+			if mimeType == "" {
+				mimeType = "image/png"
+			}
+			parts = append(parts, part{
+				InlineData: &inlineData{
+					MimeType: mimeType,
+					Data:     base64.StdEncoding.EncodeToString(raw),
+				},
+			})
+
+		default:
+			return content{}, llmerrors.NewUnsupportedModality(
+				string(p.Type), "gemini", nil,
+			)
+		}
+	}
+
+	return content{Role: role, Parts: parts}, nil
+}
+
+func (a *Adapter) parseResponse(gr generateResponse) llm.Response {
+	resp := llm.Response{
+		Role:         "assistant",
+		FinishReason: "stop",
+	}
+
+	if len(gr.Candidates) > 0 {
+		c := gr.Candidates[0]
+		resp.Content = extractContentText(c.Content)
+		if c.FinishReason != "" {
+			resp.FinishReason = mapFinishReason(c.FinishReason)
+		}
+	}
+
+	if gr.UsageMetadata != nil {
+		resp.Usage = usageOf(gr.UsageMetadata)
+	}
+
+	return resp
+}
+
+func usageOf(u *usageMetadata) llm.Usage {
+	return llm.Usage{
+		PromptTokens:     u.PromptTokenCount,
+		CompletionTokens: u.CandidatesTokenCount,
+		TotalTokens:      u.TotalTokenCount,
+	}
+}
+
+// parseToolResponse maps gr; each call carries the name the caller
+// defined, through names.
+func (a *Adapter) parseToolResponse(gr generateResponse, names *llm.ToolNames) llm.ToolResponse {
+	resp := llm.ToolResponse{}
+
+	if len(gr.Candidates) == 0 {
+		return resp
+	}
+
+	c := gr.Candidates[0]
+	var textParts []string
+	for _, p := range c.Content.Parts {
+		if p.Text != "" {
+			textParts = append(textParts, p.Text)
+		}
+		if p.FunctionCall != nil {
+			id := p.FunctionCall.ID
+			if id == "" {
+				id = newCallID()
+			}
+			resp.ToolCalls = append(resp.ToolCalls, llm.ToolCall{
+				ID:           id,
+				Name:         names.Original(p.FunctionCall.Name),
+				Arguments:    p.FunctionCall.Args,
+				ProviderData: signatureData(p.ThoughtSignature),
+			})
+		}
+	}
+	resp.Content = strings.Join(textParts, "")
+
+	return resp
+}
+
+// newCallID synthesizes a tool-call ID for a functionCall Gemini
+// returned without one, so a tool result can still quote it back in
+// [llm.Message.ToolCallID].
+func newCallID() string {
+	return "call_" + rand.Text()
+}
+
+func extractContentText(c content) string {
+	var sb strings.Builder
+	for _, p := range c.Parts {
+		if p.Text != "" {
+			sb.WriteString(p.Text)
+		}
+	}
+	return sb.String()
+}
+
+func extractText(gr generateResponse) string {
+	if len(gr.Candidates) == 0 {
+		return ""
+	}
+	return extractContentText(gr.Candidates[0].Content)
+}
+
+func extractFinishReason(gr generateResponse) string {
+	if len(gr.Candidates) == 0 {
+		return ""
+	}
+	return gr.Candidates[0].FinishReason
+}
+
+func mapFinishReason(reason string) string {
+	switch reason {
+	case "STOP":
+		return "stop"
+	case "MAX_TOKENS":
+		return "length"
+	case "SAFETY":
+		return "content_filter"
+	default:
+		return reason
+	}
+}
+
+func (a *Adapter) checkStatus(
+	resp *http.Response, model string,
+) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	// Try to parse Gemini error body.
+	var errResp struct {
+		Error *apiError `json:"error"`
+	}
+	if json.Unmarshal(body, &errResp) == nil && errResp.Error != nil {
+		return a.mapAPIError(errResp.Error, model)
+	}
+
+	// Fall back to HTTP status code mapping.
+	switch {
+	case resp.StatusCode == 401:
+		return llmerrors.NewAuth(
+			"gemini", fmt.Errorf("%s", resp.Status),
+		)
+	case resp.StatusCode == 403:
+		return llmerrors.NewPermissionDenied(
+			"gemini", fmt.Errorf("%s", resp.Status),
+		)
+	case resp.StatusCode == 404:
+		return llmerrors.NewModel(model, "gemini")
+	case resp.StatusCode == 429:
+		return llmerrors.NewRateLimit("gemini", 0)
+	case resp.StatusCode >= 500:
+		return llmerrors.NewHTTPStatusError(resp.StatusCode, resp.Status)
+	default:
+		return fmt.Errorf(
+			"gemini: unexpected status %d: %s",
+			resp.StatusCode, string(body),
+		)
+	}
+}
+
+// mapStreamError maps an SSE error payload to typed llm/errors so
+// fallback decisions work consistently for streaming.
+func mapStreamError(e *apiError, model string) error {
+	switch e.Code {
+	case 401:
+		return llmerrors.NewAuth(
+			"gemini", fmt.Errorf("%s", e.Message),
+		)
+	case 403:
+		return llmerrors.NewPermissionDenied(
+			"gemini", fmt.Errorf("%s", e.Message),
+		)
+	case 404:
+		return llmerrors.NewModel(model, "gemini")
+	case 429:
+		return llmerrors.NewRateLimit("gemini", 0)
+	default:
+		if e.Code >= 500 {
+			return llmerrors.NewHTTPStatusError(e.Code, e.Message)
+		}
+		return fmt.Errorf(
+			"gemini: stream error %d: %s", e.Code, e.Message,
+		)
+	}
+}
+
+func (a *Adapter) mapAPIError(e *apiError, model string) error {
+	switch e.Code {
+	case 401:
+		return llmerrors.NewAuth(
+			"gemini", fmt.Errorf("%s", e.Message),
+		)
+	case 403:
+		return llmerrors.NewPermissionDenied(
+			"gemini", fmt.Errorf("%s", e.Message),
+		)
+	case 404:
+		return llmerrors.NewModel(model, "gemini")
+	case 429:
+		return llmerrors.NewRateLimit("gemini", 0)
+	default:
+		if e.Code >= 500 {
+			return llmerrors.NewHTTPStatusError(e.Code, e.Message)
+		}
+		return fmt.Errorf("gemini: API error %d: %s", e.Code, e.Message)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+// declaration pins google's key order: GOOGLE_API_KEY before
+// GEMINI_API_KEY, as Google's genai SDK (google.golang.org/genai,
+// getAPIKeyFromEnv) reads them. The aim catalog also lists
+// GOOGLE_GENERATIVE_AI_API_KEY, which that SDK does not read.
+var declaration = llm.Declaration{
+	Key: &llm.ProviderKey{EnvVars: []string{"GOOGLE_API_KEY", "GEMINI_API_KEY"}},
+}
+
+func init() {
+	llm.Register("gemini", New, declaration)
+	llm.Register("google", New, declaration)
+}
+
+// toolChoice maps a checked c to Gemini's function calling mode; a
+// named tool is mode ANY limited to that function, by its sent name.
+func toolChoice(c *llm.ToolChoice, names *llm.ToolNames) *toolConfig {
+	fc := functionCallingConfig{}
+	switch c.Mode {
+	case llm.ToolChoiceAuto:
+		fc.Mode = "AUTO"
+	case llm.ToolChoiceAny:
+		fc.Mode = "ANY"
+	case llm.ToolChoiceNone:
+		fc.Mode = "NONE"
+	case llm.ToolChoiceTool:
+		fc.Mode = "ANY"
+		fc.AllowedFunctionNames = []string{names.Wire(c.Name)}
+	}
+	return &toolConfig{FunctionCallingConfig: fc}
+}

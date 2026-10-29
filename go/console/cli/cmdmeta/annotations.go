@@ -1,0 +1,130 @@
+package cmdmeta
+
+import "github.com/spf13/cobra"
+
+// Annotation keys under the kit/ reserved prefix. They are the same
+// strings cli writes; this package is the canonical home for the
+// ones it reads, and cli aliases these constants rather than
+// repeating the literals.
+const (
+	// KeyTopLevelVerb marks an intentional depth-1 leaf.
+	KeyTopLevelVerb = "kit/top-level-verb"
+	// KeyHierarchical marks an intermediate node as an intentional
+	// grouping level.
+	KeyHierarchical = "kit/hierarchical"
+	// KeyPassthrough marks a command forwarding opaque `-- args` to
+	// a child process.
+	KeyPassthrough = "kit/passthrough"
+	// KeyRetryable marks a command as safely re-runnable.
+	KeyRetryable = "kit/retryable"
+	// KeyOutputSchema holds the JSON Schema bytes for structured
+	// output.
+	KeyOutputSchema = "kit/output-schema"
+	// KeyOutputSchemaVersion holds the MAJOR.MINOR version paired
+	// with KeyOutputSchema.
+	KeyOutputSchemaVersion = "kit/output-schema-version"
+	// KeyExamples holds a JSON-encoded []Example.
+	KeyExamples = "kit/examples"
+	// KeyNextSteps holds a JSON-encoded []NextStep.
+	KeyNextSteps = "kit/next-steps"
+	// KeySideEffect holds the declared side-effect tier.
+	KeySideEffect = "kit/side-effect"
+	// KeyDryRun holds the explicit dry-run declaration.
+	KeyDryRun = "kit/dry-run"
+	// KeySelfHosting marks a command that hosts or modifies the tool
+	// itself — starts a server or supervisor, or replaces the
+	// binary — and so must only ever run from the local CLI, never
+	// from inside a served invocation.
+	KeySelfHosting = "kit/self-hosting"
+	// KeyReserved marks a command, and everything under it, as kit's
+	// own management surface: management-only on every served
+	// surface, wherever it is mounted. A kit factory that builds a
+	// command tree adopters mount sets it on the tree's root, since it
+	// has no Root to reserve a name on; it reserves the tree itself,
+	// nested under another group or not.
+	KeyReserved = "kit/reserved"
+	// KeyCacheTTL is how long the served result cache may answer a
+	// read command after a successful run ([ParseCacheTTL]). The
+	// bridge honors it only on a command declared kit/side-effect:
+	// read.
+	KeyCacheTTL = "kit/cache-ttl"
+	// KeyWithholdFrom is the comma-separated list of served surfaces
+	// a command is kept off while every other surface keeps it.
+	KeyWithholdFrom = "kit/withhold-from"
+	// KeyDeprecatedSince is the schema version at which a command was
+	// marked deprecated. It pairs with cobra.Command.Deprecated for
+	// the human message.
+	KeyDeprecatedSince = "kit/deprecated-since"
+	// KeyReplacedBy names the command that replaces a deprecated one,
+	// as a path below the root.
+	KeyReplacedBy = "kit/replaced-by"
+	// KeyExitCodes is the comma-separated list of exit-code symbols a
+	// command may produce, for manifest emission.
+	KeyExitCodes = "kit/exit-codes"
+)
+
+// ReadBool reports whether key is present on cmd with the value
+// "true". A nil command or nil annotation map reads false.
+func ReadBool(cmd *cobra.Command, key string) bool {
+	if cmd == nil || cmd.Annotations == nil {
+		return false
+	}
+	return cmd.Annotations[key] == "true"
+}
+
+// read returns the raw annotation value, tolerating a nil command
+// or nil map.
+func read(cmd *cobra.Command, key string) string {
+	if cmd == nil || cmd.Annotations == nil {
+		return ""
+	}
+	return cmd.Annotations[key]
+}
+
+// IsTopLevelVerb reports whether kit/top-level-verb is "true" on cmd.
+func IsTopLevelVerb(cmd *cobra.Command) bool {
+	return ReadBool(cmd, KeyTopLevelVerb)
+}
+
+// IsHierarchical reports whether kit/hierarchical is "true" on cmd.
+func IsHierarchical(cmd *cobra.Command) bool {
+	return ReadBool(cmd, KeyHierarchical)
+}
+
+// IsPassthrough reports whether kit/passthrough is "true" on cmd.
+func IsPassthrough(cmd *cobra.Command) bool {
+	return ReadBool(cmd, KeyPassthrough)
+}
+
+// IsRetryable reports whether kit/retryable is "true" on cmd.
+func IsRetryable(cmd *cobra.Command) bool {
+	return ReadBool(cmd, KeyRetryable)
+}
+
+// IsSelfHosting reports whether kit/self-hosting is "true" on cmd.
+func IsSelfHosting(cmd *cobra.Command) bool {
+	return ReadBool(cmd, KeySelfHosting)
+}
+
+// SetReserved marks cmd, and so its whole subtree, as kit-reserved
+// (KeyReserved).
+func SetReserved(cmd *cobra.Command) {
+	if cmd == nil {
+		return
+	}
+	if cmd.Annotations == nil {
+		cmd.Annotations = make(map[string]string)
+	}
+	cmd.Annotations[KeyReserved] = "true"
+}
+
+// InReservedTree reports whether cmd or any of its ancestors carries
+// KeyReserved.
+func InReservedTree(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if ReadBool(c, KeyReserved) {
+			return true
+		}
+	}
+	return false
+}
