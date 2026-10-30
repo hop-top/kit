@@ -1,0 +1,40 @@
+# Adopter: copy to .github/workflows/verify-no-leak.yml
+# Requires kit binary on PATH. While `setup-kit` action is in
+# development, install via go install:
+#   go install hop.top/kit/cmd/kit@latest
+name: verify-no-leak
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      # >>> kit-managed: toolchain >>>
+      - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8  # v5.1.2
+        with:
+          install: true
+          cache: true
+      - run: mise run install
+      # <<< kit-managed: toolchain <<<
+      - name: install kit
+        run: mise exec -- go install hop.top/kit/cmd/kit@latest
+      - name: scan diff
+        run: mise exec -- kit conformance verify-no-leak --diff=origin/${{ github.base_ref || 'main' }}...HEAD --format=json --output=/tmp/vnl-diff.json
+      - name: scan commit messages
+        run: mise exec -- kit conformance verify-no-leak --commit-range=origin/${{ github.base_ref || 'main' }}..HEAD --format=json
+      # Uncomment after the tool has been in your workflow long enough to trust:
+      # - name: scan PR body
+      #   if: github.event_name == 'pull_request'
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: mise exec -- kit conformance verify-no-leak --pr-body=${{ github.event.number }} --format=json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: failure()
+        with:
+          name: verify-no-leak-findings
+          path: /tmp/vnl-*.json

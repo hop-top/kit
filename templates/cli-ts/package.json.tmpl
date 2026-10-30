@@ -1,0 +1,35 @@
+{
+  "name": "{{.Name}}",
+  "version": "0.0.0",
+  "description": "{{.Description}}",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "{{.Name}}": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint src/",
+    "format": "prettier --write src/",
+    "test": "vitest run",
+    "check": "npm run lint && npm run test"
+  },
+  "author": "{{.Author}} <{{.Email}}>",
+  "license": "{{.License}}",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@hop-top/kit": "^0.5.0-alpha.10",{{/* x-release-please-version */}}
+    "commander": "15.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.19.2",
+    "eslint": "^10.12.0",
+    "prettier": "^3.9.10",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.2",
+    "vitest": "^5.0.4"
+  }
+}
