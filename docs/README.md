@@ -1,0 +1,30 @@
+# kit documentation
+
+kit is a polyglot framework monorepo (Go, TypeScript, Python and Rust, plus an
+experimental PHP SDK). Documentation is split by audience.
+
+## I'm building an app ON kit
+
+You're an **adopter**:
+
+- **[Quickstart](adopters/quickstart.md)** — 10 minutes to a working kit-based CLI
+- **[Concepts](adopters/concepts/)** — primitives and mental models
+- **[Guides](adopters/guides/)** — task-oriented how-tos
+- **[Reference](adopters/reference/)** — annotations, flags, exit codes, config shapes
+  - **[Capability index](adopters/reference/capability-index.md)** — what kit offers, with docs and per-SDK parity
+- **[Integrations](adopters/integrations/)** — connecting kit to specific tools
+
+## I'm modifying kit itself
+
+You're a **contributor**:
+
+- **[Contributing guide](contributors/contributing.md)** — dev setup, PRs, testing
+- **[Architecture](contributors/architecture/)** — how kit is built
+- **[Release process](contributors/releasing.md)** — release-please flow
+- **[Contracts](contracts/README.md)** — wire-level and behavioural contracts a kit-based tool must honour
+
+## Personas & features
+
+- **[Personas](personas/)** — adopter persona profiles
+- **[Features](features/)** — feature catalog
+- **[Announcements](announcements/)** — release notes for new primitives & SDK additions

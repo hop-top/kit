@@ -1,0 +1,38 @@
+# Central tool-versions manifest for poly-kit.
+# Single source of truth consumed by `scaffold.sh` and `kit init`.
+# Bumping a version here triggers `kit init --update` downstream.
+# See `templates/shared/README.md` for the update policy.
+# kit's own mise.toml carries these same pins (its CI runs them);
+# `make check-toolchain-parity` fails when the two disagree.
+# Every value is an exact release: a partial pin ("24", "0.13") lets
+# mise pick a new release the day it ships, past the dependency age gate.
+
+[runtimes]
+go     = "1.27.4"   # Go toolchain (matches kit's go.mod and CI)
+node   = "24.22.1"  # Node.js runtime (LTS)
+pnpm   = "12.16.0"  # Node package manager
+python = "3.14.10"  # CPython
+uv     = "0.13.6"   # Python package + project manager
+rust   = "1.99.1"   # Rust toolchain (stable; matches rust-toolchain.toml)
+
+[workflow]
+golangci-lint        = "2.15.0"   # Go linter aggregator (v2.x — required for Go 1.26+ targets; v1.x refuses)
+ruff                 = "0.17.2"   # Python linter + formatter
+lychee               = "0.24.2"   # Markdown / URL link checker
+hadolint             = "2.15.1"   # Dockerfile linter
+actionlint           = "1.7.12"   # GitHub Actions workflow linter
+shellcheck           = "0.11.0"   # Shell script linter
+shfmt                = "3.14.1"   # Shell script formatter
+"npm:release-please" = "17.11.2"  # Release automation (npm-backed)
+
+# Quality gates (`make quality`; see docs/contributors/quality-gates.md).
+# Go tools are pinned as go.mod `tool` lines and Python/TS/PHP tools as
+# dev dependencies, so each lockfile and Dependabot own them. Only the
+# tools with no home in a language lockfile live here.
+goreleaser             = "2.19.0"   # Release config check (`make pkgcheck`), gated by go
+cargo-deny             = "0.20.2"   # Rust advisories, licenses, bans, sources (`make audit`)
+cargo-binstall         = "1.26.1"   # Prebuilt-binary installer the cargo: backend uses
+"cargo:cargo-machete"  = "0.9.2"    # Rust unused dependencies (`make unused`)
+"cargo:cargo-llvm-cov" = "0.9.1"    # Rust line coverage with a floor (`make coverage`)
+"cargo:cargo-mutants"  = "27.1.0"   # Rust mutation testing (`make mutation`)
+"npm:jscpd"            = "5.4.2"    # Copy-paste detector, every language (`make dupes`)

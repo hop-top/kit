@@ -1,0 +1,33 @@
+hop-top-kit (Rust SDK)
+Copyright (c) 2026 Idea Crafters LLC
+
+This crate is licensed under the MIT License, except for the files listed
+below.
+
+Shell completion script templates
+  src/cli/completion/scripts/bash.tmpl
+  src/cli/completion/scripts/zsh.tmpl
+  src/cli/completion/scripts/fish.tmpl
+  src/cli/completion/scripts/powershell.tmpl
+
+These templates are derived from the bash (V2), zsh, fish and powershell
+completion scripts of Cobra (https://github.com/spf13/cobra), Copyright
+2013-2023 The Cobra Authors, licensed under the Apache License, Version 2.0.
+The program-dependent parts of the scripts are replaced by `@@...@@`
+tokens; the scripts are otherwise unchanged. The full licence text is in
+src/cli/completion/scripts/LICENSE-cobra.txt.
+
+Third-party crates compiled in by the `authn` feature (BSD-3-Clause)
+  subtle 2.6.1
+  ed25519-dalek 3.0.0
+  curve25519-dalek 5.0.0 (through ed25519-dalek)
+
+Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence (subtle)
+Copyright (c) 2016-2024 Isis Agora Lovecruft (subtle)
+Copyright (c) 2017-2019 isis agora lovecruft (ed25519-dalek)
+Copyright (c) 2016-2021 isis agora lovecruft, Henry de Valence
+(curve25519-dalek)
+
+Each is licensed under the BSD 3-Clause License; the conditions and the
+disclaimer are in the LICENSE file of the crate. Redistributions must
+retain the notices above.

@@ -1,0 +1,140 @@
+//! Provider-neutral LLM access, a port of Go `kit/go/ai/llm`.
+//!
+//! - [`types`]: [`Message`], [`Request`], [`Response`], tool calls,
+//!   streaming [`Token`]s.
+//! - [`Provider`] and [`TokenStream`]: the adapter seam. Futures are
+//!   boxed and runtime-free; dropping one cancels it.
+//! - [`Registry`]: URI schemes (`anthropic://claude-opus-5-5`) to
+//!   adapter factories; [`default_registry`] holds the compiled-in ones.
+//! - Keys and config: [`Registry::resolve_api_key`],
+//!   [`Registry::apply_api_key`], [`Registry::load_config`] read
+//!   llm.yaml, the environment and a [`SecretStore`] through
+//!   [`Sources`], with Go's precedence.
+//! - [`Client`]: fallback chain and bus events.
+//! - [`LlmError`]: Go's error taxonomy; [`LlmError::is_fallbackable`].
+//! - [`ToolChoice`]: `auto`, `any`, `none` or one named tool on a
+//!   tool-calling request; [`check_tool_choice`].
+//! - [`ToolNames`]: tool-name rules ([`ANTHROPIC_TOOL_NAMES`] and
+//!   friends) and the reversible sanitizer adapters run per request;
+//!   [`ToolNameMode`] is the `tool_names` provider param.
+//! - [`anthropic`], [`openai`], [`google`], [`ollama`], [`triton`] and
+//!   [`routellm`] (features `llm-anthropic`, `llm-openai`, `llm-google`,
+//!   `llm-ollama`, `llm-triton`, `llm-routellm`): the HTTP adapters.
+//! - [`picker`] (`llm-picker`): model choice by profile, pool and
+//!   budget; [`router`] (`llm-router`): routing by prompt score.
+//! - [`PoolEntry`], [`load_pool`]: the llm.yaml model pool.
+//!
+//! Keys never reach `Debug` or error text: [`redact_uri`] masks URIs,
+//! and config types print `REDACTED` in a key's place.
+//!
+//! Not ported: Go's aim catalog routing (aliases, protocol claims; the
+//! picker has a [`picker::ModelCatalog`] seam instead) and media
+//! URL/file sources.
+
+#[cfg(feature = "redact")]
+mod buscontent;
+mod client;
+mod config;
+mod endpoint;
+mod error;
+mod events;
+mod keys;
+mod pool;
+mod provider;
+mod registry;
+mod toolchoice;
+mod toolnames;
+pub mod types;
+mod uri;
+
+// Each adapter uses the part of this it needs; none uses all of it.
+#[cfg(feature = "llm-http")]
+#[allow(dead_code)]
+mod wirehttp;
+
+#[cfg(feature = "llm-anthropic")]
+pub mod anthropic;
+#[cfg(feature = "llm-google")]
+pub mod google;
+#[cfg(feature = "llm-ollama")]
+pub mod ollama;
+#[cfg(feature = "llm-openai")]
+pub mod openai;
+#[cfg(feature = "llm-picker")]
+pub mod picker;
+#[cfg(feature = "llm-routellm")]
+pub mod routellm;
+#[cfg(feature = "llm-router")]
+pub mod router;
+#[cfg(feature = "llm-triton")]
+pub mod triton;
+
+#[cfg(feature = "redact")]
+pub use buscontent::{redact_request, redact_response};
+pub use client::{Client, Topics};
+pub use config::{
+    process_env, ConfigFile, ProviderBlock, ProviderConfig, ResolvedConfig, SecretStore, Sources,
+};
+pub use endpoint::{
+    check_endpoint_url, check_key_endpoint, credentials_trusted, is_loopback_url, parse_endpoint,
+};
+pub use error::{KeyEndpointReason, LlmError, MissingKeyError, ToolNameReason};
+pub use events::{RequestEndPayload, RequestStartPayload};
+pub use keys::{AsyncSecretStore, KeyResolution, KeySource, KeySourceKind, FALLBACK_ENV_KEY};
+pub use pool::{load_pool, resolve_pool, PoolEntry};
+pub use provider::{BoxFuture, Capability, Provider, TokenStream};
+pub use registry::{default_registry, Declaration, Factory, ProviderKey, Registry, ResolveOptions};
+pub use toolchoice::{check_tool_choice, ToolChoice, ToolChoiceMode};
+pub use toolnames::{
+    ToolNameMode, ToolNameRule, ToolNames, ANTHROPIC_TOOL_NAMES, GEMINI_TOOL_NAMES,
+    OPENAI_TOOL_NAMES, TOOL_NAMES_PARAM,
+};
+pub use types::{
+    CacheControl, Media, MediaKind, Message, Part, Price, ProviderData, Request, Response, Role,
+    StreamOutcome, Thinking, ThinkingBlock, Token, ToolCall, ToolCallEvent, ToolCallEventKind,
+    ToolDef, ToolResponse, Usage,
+};
+pub use uri::{parse_uri, redact_uri, Uri};
+#[cfg(feature = "llm-http")]
+pub use wirehttp::{Limits, Sleeper};
+
+/// [`Registry::load_config`] on the default registry, with llm.yaml from
+/// disk, the process environment and no secret store.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_config(uri: &str) -> Result<ResolvedConfig, LlmError> {
+    let file = ConfigFile::load();
+    default_registry().load_config(
+        &Sources {
+            file: &file,
+            env: &process_env,
+            store: None,
+        },
+        uri,
+    )
+}
+
+/// [`Registry::apply_api_key`] on the default registry, with llm.yaml
+/// from disk and the process environment.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_api_key(store: Option<&dyn SecretStore>, uri: &str) -> Result<String, LlmError> {
+    let file = ConfigFile::load();
+    default_registry().apply_api_key(
+        &Sources {
+            file: &file,
+            env: &process_env,
+            store,
+        },
+        uri,
+    )
+}
+
+/// [`Registry::resolve`] on the default registry.
+pub fn resolve(uri: &str) -> Result<Box<dyn Provider>, LlmError> {
+    default_registry().resolve(uri)
+}
+
+/// [`Registry::resolve_with`] on the default registry; pass
+/// [`ResolveOptions::hermetic`] to read nothing ambient.
+pub fn resolve_with(uri: &str, opts: ResolveOptions) -> Result<Box<dyn Provider>, LlmError> {
+    default_registry().resolve_with(uri, opts)
+}
