@@ -1,0 +1,281 @@
+"""Legacy MCP handler — protocol revision 2024-11-05.
+
+This module is subject to one hard invariant, inherited from the Go
+reference: **2024-11-05 behaviour is preserved byte-for-byte; changes are
+additive only; nothing is deprecated.** It is a separate module rather
+than a branch inside a combined handler precisely so that invariant stays
+structurally checkable — a reviewer can confirm a modern-era change did
+not touch this file.
+
+Serves ``initialize`` (server identity and capabilities), ``ping`` (an
+empty result), ``tools/list`` (one tool per exposed leaf), and
+``tools/call`` (invoke via the bridge and render the result as content
+blocks). A notification (no ``id`` member) is never answered: HTTP 202,
+empty body, not processed. Every other method is ``-32601`` at HTTP
+**200** — a status the modern handler deliberately does
+not share, because changing it here would break the preservation rule.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .audit import (
+    ERR_AUTH_REFUSED,
+    ERR_CONFIRMATION_REQUIRED,
+    ERR_DESTRUCTIVE_BLOCKED,
+    AuditHook,
+    emit_audit,
+)
+from .bridge import (
+    DEFAULT_TOOL_NAME_SEPARATOR,
+    Bridge,
+    InvalidArgumentsError,
+    Invocation,
+    Leaf,
+    Result,
+    tool_path,
+)
+from .identity import Identity, Verifier, establish_caller, invocation_meta, unauthenticated
+from .protocol import (
+    ERR_INVALID_PARAMS,
+    ERR_INVALID_REQUEST,
+    ERR_METHOD_NOT_FOUND,
+    LEGACY_PROTOCOL_VERSION,
+    Request,
+    Response,
+    RPCRequest,
+    write_error,
+    write_result,
+)
+from .safety import (
+    DestructiveBlockedError,
+    Surface,
+    SurfaceNotEnabledError,
+    UnknownCommandError,
+)
+
+#: HTTP statuses the pre-flight gates use. Mirrored on the modern path so
+#: MCP-aware clients see ``isError`` while HTTP-only clients see a status
+#: they can act on.
+STATUS_OK = 200
+STATUS_ACCEPTED = 202
+STATUS_UNAUTHORIZED = 401
+STATUS_PRECONDITION_REQUIRED = 428
+
+
+class LegacyHandler:
+    """Serves one mount's 2024-11-05 traffic.
+
+    Stateless across requests: all mutable state lives on the bridge, so
+    one instance safely serves concurrent requests.
+    """
+
+    def __init__(
+        self,
+        bridge: Bridge,
+        *,
+        server_name: str,
+        server_version: str,
+        verifier: Verifier | None = None,
+        tool_name_separator: str = DEFAULT_TOOL_NAME_SEPARATOR,
+        audit: AuditHook | None = None,
+    ) -> None:
+        self._bridge = bridge
+        self._server_name = server_name
+        self._server_version = server_version
+        self._verifier = verifier
+        self._tool_name_separator = tool_name_separator
+        #: The mount's audit hook: one record per refusal, best-effort.
+        self._audit = audit
+
+    def serve(self, request: Request, rpc: RPCRequest) -> Response:
+        """Route one already-parsed request by method."""
+        if rpc.jsonrpc not in ("", "2.0"):
+            return write_error(rpc.id_raw, ERR_INVALID_REQUEST, "invalid jsonrpc version", 400)
+        # No id member: a notification. JSON-RPC 2.0 forbids any reply,
+        # so it is acknowledged with HTTP 202 and an empty body and is not
+        # processed (the modern handler's V2 answer). An explicit
+        # ``"id": null`` is a request and is answered.
+        if not rpc.has_id:
+            return Response(status=STATUS_ACCEPTED, headers={}, body=b"")
+        if rpc.method == "initialize":
+            return self._initialize(rpc)
+        if rpc.method == "ping":
+            # 2024-11-05 utility: the receiver MUST answer with an empty
+            # result. Legacy era only; 2026-07-28 removed ping.
+            return write_result(rpc.id_raw, {}, STATUS_OK)
+        if rpc.method == "tools/list":
+            return self._tools_list(rpc)
+        if rpc.method == "tools/call":
+            return self._tools_call(request, rpc)
+        return write_error(
+            rpc.id_raw,
+            ERR_METHOD_NOT_FOUND,
+            f"method not found: {rpc.method}",
+            STATUS_OK,
+        )
+
+    def _initialize(self, rpc: RPCRequest) -> Response:
+        """The handshake response: protocol version, capabilities, identity."""
+        return write_result(
+            rpc.id_raw,
+            {
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {
+                    "name": self._server_name,
+                    "version": self._server_version,
+                },
+            },
+            STATUS_OK,
+        )
+
+    def _tools_list(self, rpc: RPCRequest) -> Response:
+        """Enumerate every leaf exposed on the MCP surface."""
+        return write_result(
+            rpc.id_raw, {"tools": exposed_tools(self._bridge, self._tool_name_separator)}, STATUS_OK
+        )
+
+    def _tools_call(self, request: Request, rpc: RPCRequest) -> Response:
+        """Resolve, gate, invoke, and render one tool call.
+
+        Error mapping follows the surface contract: an unknown or
+        unexposed tool is a JSON-RPC ``-32602``; everything else — bridge
+        refusals, runner failures, non-zero exit codes — comes back as a
+        result with ``isError: true``, so an MCP client sees a tool
+        failure rather than a transport failure.
+        """
+        params = rpc.params if isinstance(rpc.params, dict) else {}
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            return write_error(rpc.id_raw, ERR_INVALID_PARAMS, "missing tool name", STATUS_OK)
+
+        leaf = resolve_exposed_leaf(self._bridge, name, self._tool_name_separator)
+        if leaf is None:
+            return write_error(rpc.id_raw, ERR_INVALID_PARAMS, f"unknown tool: {name}", STATUS_OK)
+
+        ident = establish_caller(self._verifier, request)
+        if auth_refused(leaf, ident):
+            self._refused(leaf, ERR_AUTH_REFUSED)
+            return unauthenticated(
+                write_result(
+                    rpc.id_raw,
+                    error_result_block("authentication required"),
+                    STATUS_UNAUTHORIZED,
+                )
+            )
+        # Arguments are checked before the confirmation gate: a person
+        # is never asked to approve a call that cannot run as sent.
+        arguments = params.get("arguments")
+        try:
+            flags, args = leaf.split_arguments(arguments if isinstance(arguments, dict) else {})
+        except InvalidArgumentsError as exc:
+            return write_result(rpc.id_raw, error_result_block(str(exc)), STATUS_OK)
+        gate = preflight_refusal(request, leaf)
+        if gate is not None:
+            message, status = gate
+            self._refused(leaf, ERR_CONFIRMATION_REQUIRED)
+            return write_result(rpc.id_raw, error_result_block(message), status)
+
+        inv = Invocation(
+            path=leaf.path,
+            flags=flags,
+            meta=invocation_meta(ident),
+            args=args,
+        )
+        try:
+            result = self._bridge.invoke(inv)
+        except (UnknownCommandError, SurfaceNotEnabledError):
+            return write_error(rpc.id_raw, ERR_INVALID_PARAMS, f"unknown tool: {name}", STATUS_OK)
+        except DestructiveBlockedError as exc:
+            self._refused(leaf, ERR_DESTRUCTIVE_BLOCKED)
+            return write_result(rpc.id_raw, error_result_block(str(exc)), STATUS_OK)
+        except Exception as exc:
+            return write_result(rpc.id_raw, error_result_block(str(exc)), STATUS_OK)
+
+        return write_result(rpc.id_raw, render_call_result(result), STATUS_OK)
+
+    def _refused(self, leaf: Leaf, error: str) -> None:
+        """Audit one pre-flight refusal of ``leaf``; the response is untouched."""
+        emit_audit(self._audit, path=leaf.path, spec_version=LEGACY_PROTOCOL_VERSION, error=error)
+
+
+# --- shared renderers ---------------------------------------------------
+#
+# Both eras call these. They live here rather than in a third module
+# because the modern era is defined as "legacy's rendering plus envelope
+# members": keeping one implementation is what makes schema and content
+# drift between the two impossible rather than merely unlikely.
+
+
+def exposed_tools(
+    bridge: Bridge, separator: str = DEFAULT_TOOL_NAME_SEPARATOR
+) -> list[dict[str, Any]]:
+    """Tool descriptors for every leaf exposed on the MCP surface."""
+    return [
+        leaf.tool_envelope(separator)
+        for leaf in bridge.leaves()
+        if leaf.enabled.get(Surface.MCP, False)
+    ]
+
+
+def resolve_exposed_leaf(
+    bridge: Bridge, name: str, separator: str = DEFAULT_TOOL_NAME_SEPARATOR
+) -> Leaf | None:
+    """Resolve a tool name, split on ``separator``, to an MCP-exposed leaf, or ``None``."""
+    try:
+        leaf = bridge.resolve_leaf(tool_path(name, separator))
+    except UnknownCommandError:
+        return None
+    if not leaf.enabled.get(Surface.MCP, False):
+        return None
+    return leaf
+
+
+def auth_refused(leaf: Leaf, ident: Identity | None) -> bool:
+    """Whether the ``kit/auth-required`` gate refuses the call.
+
+    Both eras ask this one question, so they cannot drift on what
+    "authenticated" means: only an identity the mount's verifier
+    established admits the leaf. An ``Authorization`` header is
+    presence, not verification.
+    """
+    return leaf.cls.auth_required and ident is None
+
+
+def preflight_refusal(request: Request, leaf: Leaf) -> tuple[str, int] | None:
+    """Apply the legacy confirmation header gate.
+
+    Returns ``(message, status)`` when the call must be refused, or
+    ``None`` to proceed. The auth gate runs first, through
+    :func:`auth_refused`; the modern path swaps this confirmation gate
+    for a strategy slot.
+    """
+    if leaf.cls.requires_confirmation and not request.headers.get("x-confirm-token"):
+        return "confirmation required", STATUS_PRECONDITION_REQUIRED
+    return None
+
+
+def render_call_result(result: Result) -> dict[str, Any]:
+    """Map a bridge result onto the ``tools/call`` result envelope.
+
+    The content list always carries at least the stdout block (possibly
+    empty); stderr adds a ``[stderr] `` prefixed block, and a structured
+    payload adds its JSON serialisation as a third text block — which
+    doubles as the spec-recommended serialised fallback for
+    ``structuredContent`` on the modern path.
+    """
+    from ._json import dumps
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": result.stdout}]
+    if result.stderr:
+        content.append({"type": "text", "text": "[stderr] " + result.stderr})
+    if result.data is not None:
+        content.append({"type": "text", "text": dumps(result.data)})
+    return {"content": content, "isError": result.exit_code != 0}
+
+
+def error_result_block(message: str) -> dict[str, Any]:
+    """A ``tools/call`` result flagged ``isError`` with one text block."""
+    return {"content": [{"type": "text", "text": message}], "isError": True}

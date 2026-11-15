@@ -1,0 +1,7 @@
+# Rust
+target/
+# Cargo.lock: commit for bins (this template ships a CLI), ignore for libs
+*.rs.bk
+**/*.rs.bk
+*.pdb
+mutants.out*/
