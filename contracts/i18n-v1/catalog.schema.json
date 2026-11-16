@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hop.top/kit/contracts/i18n-v1/catalog.schema.json",
+  "title": "i18n-v1 message catalog",
+  "description": "One catalog = one locale. Structural rules only; whether a message is valid MessageFormat 2 is pinned by catalog-corpus.json (cases marked schema_gap) and by the vendored MF2 suite, not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "locale", "messages"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "v": { "const": 1 },
+    "locale": {
+      "type": "string",
+      "pattern": "^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$"
+    },
+    "messages": { "$ref": "#/$defs/namespace" }
+  },
+  "$defs": {
+    "node": {
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/leaf" },
+        { "$ref": "#/$defs/nonEmptyNamespace" }
+      ]
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": { "^[A-Za-z0-9_-]+$": { "$ref": "#/$defs/node" } }
+    },
+    "nonEmptyNamespace": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": { "^[A-Za-z0-9_-]+$": { "$ref": "#/$defs/node" } }
+    },
+    "leaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["$msg"],
+      "properties": {
+        "$msg": { "type": "string" },
+        "$desc": { "type": "string" }
+      }
+    }
+  }
+}
