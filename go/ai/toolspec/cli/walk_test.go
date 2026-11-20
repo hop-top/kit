@@ -1,0 +1,625 @@
+package cli
+
+import (
+	"testing"
+
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"hop.top/kit/go/ai/toolspec"
+	kitcli "hop.top/kit/go/console/cli"
+)
+
+// rootWith is a tiny test fixture builder so each test case can read
+// linearly without rebuilding cobra trees by hand.
+func rootWith(name string, mods ...func(*cobra.Command)) *cobra.Command {
+	root := &cobra.Command{Use: name}
+	for _, m := range mods {
+		m(root)
+	}
+	return root
+}
+
+func addChild(name string, mods ...func(*cobra.Command)) func(*cobra.Command) {
+	return func(parent *cobra.Command) {
+		c := &cobra.Command{Use: name, Run: func(*cobra.Command, []string) {}}
+		for _, m := range mods {
+			m(c)
+		}
+		parent.AddCommand(c)
+	}
+}
+
+// findCommand returns the projected toolspec.Command with the given
+// leaf name, or nil. Recursive so deep trees work too.
+func findCommand(cmds []toolspec.Command, name string) *toolspec.Command {
+	for i := range cmds {
+		if cmds[i].Name == name {
+			return &cmds[i]
+		}
+		if c := findCommand(cmds[i].Children, name); c != nil {
+			return c
+		}
+	}
+	return nil
+}
+
+// --- Basic shape ---------------------------------------------------
+
+func TestWalkCobra_NilRoot(t *testing.T) {
+	spec := WalkCobra(nil)
+	require.NotNil(t, spec)
+	assert.Empty(t, spec.Name)
+	assert.Empty(t, spec.Commands)
+}
+
+func TestWalkCobra_EmptyRoot(t *testing.T) {
+	root := rootWith("mytool")
+	spec := WalkCobra(root)
+	require.NotNil(t, spec)
+	assert.Equal(t, "mytool", spec.Name)
+	assert.Empty(t, spec.Commands)
+}
+
+func TestWalkCobra_SimpleChildren(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("list"),
+		addChild("create"),
+	)
+	spec := WalkCobra(root)
+	require.Len(t, spec.Commands, 2)
+	names := []string{spec.Commands[0].Name, spec.Commands[1].Name}
+	assert.ElementsMatch(t, []string{"list", "create"}, names)
+}
+
+func TestWalkCobra_RecursiveChildren(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("task",
+			addChild("list"),
+			addChild("create"),
+			addChild("delete"),
+		),
+	)
+	spec := WalkCobra(root)
+	require.Len(t, spec.Commands, 1)
+	task := spec.Commands[0]
+	assert.Equal(t, "task", task.Name)
+	require.Len(t, task.Children, 3)
+	assert.NotNil(t, findCommand(spec.Commands, "delete"))
+}
+
+// --- Skip rules ----------------------------------------------------
+
+func TestWalkCobra_SkipsHidden(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("public"),
+		addChild("secret", func(c *cobra.Command) { c.Hidden = true }),
+	)
+	spec := WalkCobra(root)
+	assert.NotNil(t, findCommand(spec.Commands, "public"))
+	assert.Nil(t, findCommand(spec.Commands, "secret"))
+}
+
+func TestWalkCobra_IncludeHidden(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("public"),
+		addChild("secret", func(c *cobra.Command) { c.Hidden = true }),
+	)
+	spec := WalkCobra(root, WithIncludeHidden())
+	assert.NotNil(t, findCommand(spec.Commands, "secret"))
+}
+
+func TestWalkCobra_SkipsBuiltins(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("real"),
+		addChild("help"),
+		addChild("completion"),
+		addChild("__complete"),
+	)
+	spec := WalkCobra(root)
+	assert.NotNil(t, findCommand(spec.Commands, "real"))
+	assert.Nil(t, findCommand(spec.Commands, "help"))
+	assert.Nil(t, findCommand(spec.Commands, "completion"))
+	assert.Nil(t, findCommand(spec.Commands, "__complete"))
+}
+
+// TestWalkCobra_SkipsRealCompletionCommand registers cobra's own
+// completion command: a non-runnable group whose shell children are
+// runnable. The group is a builtin even though it has no action, so
+// neither it nor its children reach the spec.
+func TestWalkCobra_SkipsRealCompletionCommand(t *testing.T) {
+	root := rootWith("mytool", addChild("real"))
+	root.InitDefaultCompletionCmd()
+	completion, _, err := root.Find([]string{"completion"})
+	require.NoError(t, err)
+	require.Equal(t, "completion", completion.Name(), "cobra did not register completion")
+	require.False(t, completion.Runnable(), "fixture assumes a non-runnable group")
+
+	spec := WalkCobra(root)
+	assert.NotNil(t, findCommand(spec.Commands, "real"))
+	assert.Nil(t, findCommand(spec.Commands, "completion"))
+	assert.Nil(t, findCommand(spec.Commands, "bash"))
+}
+
+// hiddenGroupRoot builds a root with a hidden, non-runnable group
+// holding one visible-by-itself child.
+func hiddenGroupRoot() *cobra.Command {
+	root := rootWith("mytool", addChild("public"))
+	group := &cobra.Command{Use: "internal", Hidden: true}
+	group.AddCommand(&cobra.Command{Use: "probe", Run: func(*cobra.Command, []string) {}})
+	root.AddCommand(group)
+	return root
+}
+
+func TestWalkCobra_SkipsHiddenGroupAndChildren(t *testing.T) {
+	spec := WalkCobra(hiddenGroupRoot())
+	assert.NotNil(t, findCommand(spec.Commands, "public"))
+	assert.Nil(t, findCommand(spec.Commands, "internal"))
+	assert.Nil(t, findCommand(spec.Commands, "probe"))
+}
+
+func TestWalkCobra_IncludeHiddenGroup(t *testing.T) {
+	spec := WalkCobra(hiddenGroupRoot(), WithIncludeHidden())
+	group := findCommand(spec.Commands, "internal")
+	require.NotNil(t, group)
+	require.Len(t, group.Children, 1)
+	assert.Equal(t, "probe", group.Children[0].Name)
+}
+
+func TestWalkCobra_SkipsSpecCommandAnnotation(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("real"),
+		addChild("spec", func(c *cobra.Command) {
+			c.Annotations = map[string]string{"kit/spec-command": "true"}
+		}),
+	)
+	spec := WalkCobra(root)
+	assert.NotNil(t, findCommand(spec.Commands, "real"))
+	assert.Nil(t, findCommand(spec.Commands, "spec"))
+}
+
+func TestWalkCobra_CustomSkip(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("keep"),
+		addChild("drop-me"),
+	)
+	spec := WalkCobra(root, WithSkip(func(c *cobra.Command) bool {
+		return c.Name() == "drop-me"
+	}))
+	assert.NotNil(t, findCommand(spec.Commands, "keep"))
+	assert.Nil(t, findCommand(spec.Commands, "drop-me"))
+}
+
+// --- Safety inference ----------------------------------------------
+
+// TestWalkCobra_DefaultSafetyCaution covers the unannotated leaf
+// whose name trips no heuristic. Caution, not safe: the level enum
+// has no "undeclared" value and safe is the one answer kit cannot
+// justify for a command that said nothing. Confirmation still stays
+// off — caution is a label for the agent, not a prompt for the user.
+func TestWalkCobra_DefaultSafetyCaution(t *testing.T) {
+	root := rootWith("mytool", addChild("list"))
+	spec := WalkCobra(root)
+	list := findCommand(spec.Commands, "list")
+	require.NotNil(t, list)
+	require.NotNil(t, list.Safety)
+	assert.Equal(t, toolspec.SafetyLevelCaution, list.Safety.Level)
+	assert.False(t, list.Safety.RequiresConfirmation)
+}
+
+func TestWalkCobra_DefaultSafetyDestructive(t *testing.T) {
+	for _, name := range []string{"delete", "remove", "rm", "destroy", "purge", "drop"} {
+		t.Run(name, func(t *testing.T) {
+			root := rootWith("mytool", addChild(name))
+			spec := WalkCobra(root)
+			cmd := findCommand(spec.Commands, name)
+			require.NotNil(t, cmd, "command %q missing from spec", name)
+			require.NotNil(t, cmd.Safety, "Safety nil for %q", name)
+			assert.Equal(t, toolspec.SafetyLevelDangerous, cmd.Safety.Level)
+			assert.True(t, cmd.Safety.RequiresConfirmation)
+		})
+	}
+}
+
+func TestWalkCobra_CustomSafety(t *testing.T) {
+	root := rootWith("mytool", addChild("delete"))
+	spec := WalkCobra(root, WithCustomSafety(func(c *cobra.Command) *toolspec.Safety {
+		// Override: never classify as dangerous.
+		return &toolspec.Safety{Level: toolspec.SafetyLevelCaution}
+	}))
+	del := findCommand(spec.Commands, "delete")
+	require.NotNil(t, del)
+	require.NotNil(t, del.Safety)
+	assert.Equal(t, toolspec.SafetyLevelCaution, del.Safety.Level)
+	assert.False(t, del.Safety.RequiresConfirmation)
+}
+
+func TestWalkCobra_CustomSafetyNil(t *testing.T) {
+	// Returning nil from the safety classifier produces a Command
+	// with no Safety field (consumers see it as "unknown").
+	root := rootWith("mytool", addChild("list"))
+	spec := WalkCobra(root, WithCustomSafety(func(c *cobra.Command) *toolspec.Safety {
+		return nil
+	}))
+	list := findCommand(spec.Commands, "list")
+	require.NotNil(t, list)
+	assert.Nil(t, list.Safety)
+}
+
+// --- Deprecation ---------------------------------------------------
+
+func TestWalkCobra_DeprecatedCobraField(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("old", func(c *cobra.Command) {
+			c.Deprecated = "use 'new' instead"
+		}),
+	)
+	spec := WalkCobra(root)
+	old := findCommand(spec.Commands, "old")
+	require.NotNil(t, old)
+	assert.True(t, old.Deprecated)
+	assert.Equal(t, "use 'new' instead", old.DeprecatedSince)
+}
+
+func TestWalkCobra_DeprecatedAnnotations(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("old", func(c *cobra.Command) {
+			c.Annotations = map[string]string{
+				"kit/deprecated-since": "1.2",
+				"kit/replaced-by":      "newcmd",
+			}
+		}),
+	)
+	spec := WalkCobra(root)
+	old := findCommand(spec.Commands, "old")
+	require.NotNil(t, old)
+	assert.True(t, old.Deprecated)
+	assert.Equal(t, "1.2", old.DeprecatedSince)
+	assert.Equal(t, "newcmd", old.ReplacedBy)
+}
+
+func TestWalkCobra_WithoutDeprecated(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("old", func(c *cobra.Command) {
+			c.Deprecated = "use 'new'"
+		}),
+	)
+	spec := WalkCobra(root, WithoutDeprecated())
+	old := findCommand(spec.Commands, "old")
+	require.NotNil(t, old, "command should still appear; only deprecation metadata suppressed")
+	assert.False(t, old.Deprecated)
+	assert.Empty(t, old.DeprecatedSince)
+}
+
+// --- Contract from annotations -------------------------------------
+
+func TestWalkCobra_ContractFromAnnotations(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("write", func(c *cobra.Command) {
+			c.Annotations = map[string]string{
+				"kit/side-effect": "write",
+				"kit/idempotent":  "yes",
+			}
+		}),
+	)
+	spec := WalkCobra(root)
+	w := findCommand(spec.Commands, "write")
+	require.NotNil(t, w)
+	require.NotNil(t, w.Contract)
+	assert.True(t, w.Contract.Idempotent)
+	assert.Equal(t, []string{"write"}, w.Contract.SideEffects)
+}
+
+func TestWalkCobra_ContractAbsent(t *testing.T) {
+	root := rootWith("mytool", addChild("plain"))
+	spec := WalkCobra(root)
+	p := findCommand(spec.Commands, "plain")
+	require.NotNil(t, p)
+	assert.Nil(t, p.Contract)
+}
+
+// --- Aliases -------------------------------------------------------
+
+func TestWalkCobra_AliasesPropagate(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("list", func(c *cobra.Command) {
+			c.Aliases = []string{"ls", "l"}
+		}),
+	)
+	spec := WalkCobra(root)
+	list := findCommand(spec.Commands, "list")
+	require.NotNil(t, list)
+	assert.Equal(t, []string{"ls", "l"}, list.Aliases)
+}
+
+// --- Flags: persistent at root, local at command ------------------
+
+func TestWalkCobra_PersistentFlagsAtRoot(t *testing.T) {
+	root := rootWith("mytool")
+	root.PersistentFlags().String("config", "", "config path")
+	root.PersistentFlags().BoolP("verbose", "v", false, "verbose")
+	spec := WalkCobra(root)
+	require.Len(t, spec.Flags, 2)
+	names := []string{spec.Flags[0].Name, spec.Flags[1].Name}
+	assert.ElementsMatch(t, []string{"config", "verbose"}, names)
+}
+
+func TestWalkCobra_LocalFlagsOnCommand(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("deploy", func(c *cobra.Command) {
+			c.Flags().String("env", "staging", "target env")
+			c.Flags().BoolP("dry-run", "n", false, "no-op")
+		}),
+	)
+	spec := WalkCobra(root)
+	dep := findCommand(spec.Commands, "deploy")
+	require.NotNil(t, dep)
+	require.Len(t, dep.Flags, 2)
+}
+
+func TestWalkCobra_LocalFlagsExcludeInherited(t *testing.T) {
+	// A persistent flag declared on the root must NOT show up as a
+	// local flag on children — that would double-count it (already
+	// at spec.Flags root level).
+	root := rootWith("mytool", addChild("list"))
+	root.PersistentFlags().String("config", "", "config path")
+	spec := WalkCobra(root)
+	list := findCommand(spec.Commands, "list")
+	require.NotNil(t, list)
+	for _, f := range list.Flags {
+		assert.NotEqual(t, "config", f.Name, "inherited persistent flag leaked into local flags")
+	}
+}
+
+func TestWalkCobra_HiddenFlagsSkipped(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("deploy", func(c *cobra.Command) {
+			c.Flags().String("public", "", "ok")
+			f := c.Flags().Lookup("public")
+			_ = f
+			c.Flags().String("secret", "", "")
+			c.Flags().Lookup("secret").Hidden = true
+		}),
+	)
+	spec := WalkCobra(root)
+	dep := findCommand(spec.Commands, "deploy")
+	require.NotNil(t, dep)
+	for _, f := range dep.Flags {
+		assert.NotEqual(t, "secret", f.Name, "hidden flag leaked")
+	}
+}
+
+func TestWalkCobra_DeprecatedFlagMarked(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("deploy", func(c *cobra.Command) {
+			c.Flags().String("legacy", "", "")
+			require.NoError(t, c.Flags().MarkDeprecated("legacy", "use --modern instead"))
+		}),
+	)
+	spec := WalkCobra(root)
+	dep := findCommand(spec.Commands, "deploy")
+	require.NotNil(t, dep)
+	var legacy *toolspec.Flag
+	for i := range dep.Flags {
+		if dep.Flags[i].Name == "legacy" {
+			legacy = &dep.Flags[i]
+		}
+	}
+	require.NotNil(t, legacy)
+	assert.True(t, legacy.Deprecated)
+}
+
+// --- Schema version ------------------------------------------------
+
+func TestWalkCobra_SchemaVersionEmpty(t *testing.T) {
+	// WalkCobra leaves SchemaVersion empty; RegisterSpecCommand sets
+	// it from its own arg. Direct callers set it post-walk.
+	root := rootWith("mytool")
+	spec := WalkCobra(root)
+	assert.Empty(t, spec.SchemaVersion)
+}
+
+// --- Integration: deeply-nested tree with mixed annotations -------
+
+func TestWalkCobra_RealisticTree(t *testing.T) {
+	root := rootWith("mytool")
+	root.PersistentFlags().String("config", "", "config")
+
+	// task list (unannotated — declares nothing)
+	// task delete (destructive heuristic)
+	// task archive (annotation: write + idempotent)
+	root.AddCommand(&cobra.Command{
+		Use: "task",
+		Run: func(*cobra.Command, []string) {},
+	})
+	task := root.Commands()[0]
+	task.AddCommand(&cobra.Command{
+		Use: "list",
+		Run: func(*cobra.Command, []string) {},
+	})
+	task.AddCommand(&cobra.Command{
+		Use: "delete",
+		Run: func(*cobra.Command, []string) {},
+	})
+	task.AddCommand(&cobra.Command{
+		Use: "archive",
+		Run: func(*cobra.Command, []string) {},
+		Annotations: map[string]string{
+			"kit/side-effect": "write",
+			"kit/idempotent":  "yes",
+		},
+	})
+
+	spec := WalkCobra(root)
+
+	require.Equal(t, "mytool", spec.Name)
+	require.Len(t, spec.Flags, 1)
+	assert.Equal(t, "config", spec.Flags[0].Name)
+
+	taskCmd := findCommand(spec.Commands, "task")
+	require.NotNil(t, taskCmd)
+	require.Len(t, taskCmd.Children, 3)
+
+	listCmd := findCommand(spec.Commands, "list")
+	require.NotNil(t, listCmd)
+	require.NotNil(t, listCmd.Safety)
+	// list declares nothing, so it is caution, not safe: the
+	// verb reads like an observation but kit was never told so.
+	assert.Equal(t, toolspec.SafetyLevelCaution, listCmd.Safety.Level)
+	assert.Nil(t, listCmd.Contract)
+
+	delCmd := findCommand(spec.Commands, "delete")
+	require.NotNil(t, delCmd)
+	require.NotNil(t, delCmd.Safety)
+	assert.Equal(t, toolspec.SafetyLevelDangerous, delCmd.Safety.Level)
+	assert.True(t, delCmd.Safety.RequiresConfirmation)
+
+	archCmd := findCommand(spec.Commands, "archive")
+	require.NotNil(t, archCmd)
+	require.NotNil(t, archCmd.Contract)
+	assert.True(t, archCmd.Contract.Idempotent)
+	assert.Equal(t, []string{"write"}, archCmd.Contract.SideEffects)
+}
+
+// TestWalkCobra_PositionalArgs pins the projection of declared and
+// undeclared positional arguments onto toolspec.Command.
+func TestWalkCobra_PositionalArgs(t *testing.T) {
+	root := &cobra.Command{Use: "tool"}
+	noop := func(*cobra.Command, []string) error { return nil }
+	root.AddCommand(
+		&cobra.Command{Use: "add <name> [note]", RunE: noop,
+			Annotations: map[string]string{"kit/args": "name,note?"}},
+		&cobra.Command{Use: "label <name>", RunE: noop},
+		&cobra.Command{Use: "list", RunE: noop},
+	)
+	spec := WalkCobra(root)
+	byName := map[string]toolspec.Command{}
+	for _, c := range spec.Commands {
+		byName[c.Name] = c
+	}
+
+	if got := byName["add"].Args; len(got) != 2 ||
+		got[0] != (toolspec.Arg{Name: "name", Required: true}) ||
+		got[1] != (toolspec.Arg{Name: "note"}) {
+		t.Errorf("add Args = %+v, want name (required), note (optional)", got)
+	}
+	if byName["add"].UndeclaredArgs {
+		t.Error("add declares its arguments")
+	}
+	if !byName["label"].UndeclaredArgs || byName["label"].Args != nil {
+		t.Errorf("label = %+v, want undeclared arguments", byName["label"])
+	}
+	if byName["list"].UndeclaredArgs || byName["list"].Args != nil {
+		t.Errorf("list = %+v, want no arguments", byName["list"])
+	}
+}
+
+// --- Flag default and choices ------------------------------------
+
+// TestWalkCobra_FlagDefaultAndChoices pins that the ToolSpec flag
+// carries the pflag default spelled exactly as the Manifest's
+// `default` (DefValue, omitted when empty) and the closed value set
+// cli.WithFlagEnum stamps onto the flag.
+func TestWalkCobra_FlagDefaultAndChoices(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("list", func(c *cobra.Command) {
+			c.Flags().String("status", "TODO", "filter")
+			c.Flags().Lookup("status").Annotations = map[string][]string{
+				"kit.cli.flag.enum": {"TODO", "DONE"},
+			}
+			c.Flags().StringSlice("tag", []string{"a", "b"}, "tags")
+			c.Flags().String("plain", "", "no default")
+			c.Flags().Bool("all", false, "every row")
+		}),
+	)
+	root.PersistentFlags().String("format", "table", "output format")
+
+	spec := WalkCobra(root)
+	list := findCommand(spec.Commands, "list")
+	require.NotNil(t, list)
+	byName := map[string]toolspec.Flag{}
+	for _, f := range list.Flags {
+		byName[f.Name] = f
+	}
+	assert.Equal(t, "TODO", byName["status"].Default)
+	assert.Equal(t, []string{"TODO", "DONE"}, byName["status"].Choices)
+	assert.Equal(t, "[a,b]", byName["tag"].Default, "pflag DefValue spelling, as the Manifest carries")
+	assert.Nil(t, byName["tag"].Choices)
+	assert.Empty(t, byName["plain"].Default, "empty default is omitted, as the Manifest does")
+	assert.Equal(t, "false", byName["all"].Default)
+
+	require.Len(t, spec.Flags, 1)
+	assert.Equal(t, "table", spec.Flags[0].Default, "root persistent flags carry their default too")
+
+	// The ToolSpec and the Manifest agree byte-for-byte on default.
+	m := BuildManifest(&kitcli.Root{Cmd: root, Config: kitcli.Config{Name: "mytool"}}, "1.1", false)
+	require.Len(t, m.Commands, 1)
+	mf := map[string]toolspec.ManifestFlag{}
+	for _, f := range m.Commands[0].Flags {
+		mf[f.Name] = f
+	}
+	for name, f := range byName {
+		assert.Equal(t, mf[name].Default, f.Default, "flag %s default", name)
+	}
+}
+
+// --- Variadic args -------------------------------------------------
+
+func TestWalkCobra_VariadicArgs(t *testing.T) {
+	root := rootWith("mytool",
+		addChild("attach", func(c *cobra.Command) {
+			c.Annotations = map[string]string{"kit/args": "name, note?, files...?"}
+		}),
+		addChild("cat", func(c *cobra.Command) {
+			c.Annotations = map[string]string{"kit/args": "files..."}
+		}),
+	)
+	spec := WalkCobra(root)
+	assert.Equal(t, []toolspec.Arg{
+		{Name: "name", Required: true},
+		{Name: "note"},
+		{Name: "files", Variadic: true},
+	}, findCommand(spec.Commands, "attach").Args)
+	assert.Equal(t, []toolspec.Arg{{Name: "files", Required: true, Variadic: true}},
+		findCommand(spec.Commands, "cat").Args)
+}
+
+// --- Contract: idempotent class and retryable ----------------------
+
+// TestWalkCobra_ContractIdempotentClass pins that every declared
+// kit/idempotent value reaches the ToolSpec: the bool stays true iff
+// "yes", and IdempotentClass carries the raw closed-set value, so
+// "no" and "conditional" are no longer lost.
+func TestWalkCobra_ContractIdempotentClass(t *testing.T) {
+	cases := []struct {
+		raw       string
+		wantBool  bool
+		wantClass string
+		wantNil   bool
+	}{
+		{"yes", true, "yes", false},
+		{"no", false, "no", false},
+		{"conditional", false, "conditional", false},
+		{"", false, "", true},
+		{"maybe", false, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			root := rootWith("mytool", addChild("run", func(c *cobra.Command) {
+				if tc.raw != "" {
+					c.Annotations = map[string]string{"kit/idempotent": tc.raw}
+				}
+			}))
+			cmd := findCommand(WalkCobra(root).Commands, "run")
+			require.NotNil(t, cmd)
+			if tc.wantNil {
+				assert.Nil(t, cmd.Contract)
+				return
+			}
+			require.NotNil(t, cmd.Contract)
+			assert.Equal(t, tc.wantBool, cmd.Contract.Idempotent)
+			assert.Equal(t, tc.wantClass, cmd.Contract.IdempotentClass)
+		})
+	}
+}
