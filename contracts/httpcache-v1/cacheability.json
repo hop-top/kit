@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "note": "Cross-language cacheability gate vectors for kit/storage/httpcache. Every port consumes these so all of them gate identically. request_cacheable pins which requests are eligible for caching; response_cacheable pins which responses may be stored. See keying.json for cache-key derivation and entry.json for the on-store envelope.",
+  "request_cacheable": [
+    { "name": "plain GET", "method": "GET", "headers": {}, "want": true },
+    { "name": "GET with unrelated header", "method": "GET", "headers": { "Accept": "text/html" }, "want": true },
+    { "name": "POST never cached", "method": "POST", "headers": {}, "want": false },
+    { "name": "HEAD never cached", "method": "HEAD", "headers": {}, "want": false },
+    { "name": "PUT never cached", "method": "PUT", "headers": {}, "want": false },
+    { "name": "request no-store opts out", "method": "GET", "headers": { "Cache-Control": "no-store" }, "want": false },
+    { "name": "request no-store among directives", "method": "GET", "headers": { "Cache-Control": "no-cache, no-store" }, "want": false },
+    { "name": "no-store match is case-insensitive", "method": "GET", "headers": { "Cache-Control": "NO-STORE" }, "want": false },
+    { "name": "no-store is token-bounded", "method": "GET", "headers": { "Cache-Control": "no-store-extension" }, "want": true }
+  ],
+  "response_cacheable": [
+    { "name": "200 OK", "status": 200, "headers": {}, "want": true },
+    { "name": "204 No Content", "status": 204, "headers": {}, "want": true },
+    { "name": "299 upper 2xx bound", "status": 299, "headers": {}, "want": true },
+    { "name": "301 redirect not cached", "status": 301, "headers": {}, "want": false },
+    { "name": "404 not cached", "status": 404, "headers": {}, "want": false },
+    { "name": "500 not cached", "status": 500, "headers": {}, "want": false },
+    { "name": "response no-store opts out", "status": 200, "headers": { "Cache-Control": "no-store" }, "want": false },
+    { "name": "response no-store among directives", "status": 200, "headers": { "Cache-Control": "max-age=60, no-store" }, "want": false }
+  ],
+  "extension_note": "The sections below extend the v1 gate with the request-dependent rules of RFC 9111. They are additive: the v1 sections above are unchanged.",
+  "vary_response_cacheable": [
+    { "name": "Vary: * is never stored", "status": 200, "headers": { "Vary": "*" }, "want": false },
+    { "name": "Vary: * among fields is never stored", "status": 200, "headers": { "Vary": "Accept, *" }, "want": false },
+    { "name": "Vary with fields is stored (per variant)", "status": 200, "headers": { "Vary": "Accept-Language" }, "want": true }
+  ],
+  "authorization_response_cacheable": [
+    { "name": "no directive: not stored", "response_headers": {}, "want": false },
+    { "name": "max-age alone: not stored", "response_headers": { "Cache-Control": "max-age=60" }, "want": false },
+    { "name": "private: not stored", "response_headers": { "Cache-Control": "private" }, "want": false },
+    { "name": "public: stored", "response_headers": { "Cache-Control": "public" }, "want": true },
+    { "name": "public is case-insensitive", "response_headers": { "Cache-Control": "max-age=60, PUBLIC" }, "want": true },
+    { "name": "s-maxage alone: not stored (cache does not honor s-maxage freshness)", "response_headers": { "Cache-Control": "s-maxage=60" }, "want": false },
+    { "name": "must-revalidate alone: not stored (cache does not revalidate)", "response_headers": { "Cache-Control": "must-revalidate" }, "want": false },
+    { "name": "public plus must-revalidate: stored", "response_headers": { "Cache-Control": "public, must-revalidate" }, "want": true },
+    { "name": "directives are token-bounded", "response_headers": { "Cache-Control": "publicly-visible, s-maxage-ish=1" }, "want": false },
+    { "name": "public plus no-store: not stored", "response_headers": { "Cache-Control": "public, no-store" }, "want": false },
+    { "name": "private plus must-revalidate: not stored", "response_headers": { "Cache-Control": "private, must-revalidate" }, "want": false },
+    { "name": "public plus private: not stored", "response_headers": { "Cache-Control": "public, private" }, "want": false },
+    { "name": "private with field list plus s-maxage: not stored", "response_headers": { "Cache-Control": "private=\"Set-Cookie\", s-maxage=60" }, "want": false }
+  ],
+  "private_note": "The store is shared across identities (RFC 9111 §5.2.2.7): a response marked private is never stored, with or without Authorization on the request.",
+  "private_response_cacheable": [
+    { "name": "private: not stored", "status": 200, "headers": { "Cache-Control": "private" }, "want": false },
+    { "name": "private among directives: not stored", "status": 200, "headers": { "Cache-Control": "max-age=60, PRIVATE" }, "want": false },
+    { "name": "private is token-bounded", "status": 200, "headers": { "Cache-Control": "private-ish" }, "want": true }
+  ]
+}
