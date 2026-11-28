@@ -1,0 +1,1202 @@
+//! The command-tree projection: `GET /v1/commands` lists the tree a kit
+//! CLI defines, each invocable command is mounted under it, and the
+//! OpenAPI document describes them. A port of `go/transport/api`'s
+//! projection, built on [`cli::Root::model`](crate::cli::Root::model):
+//! the projection reads the same kit-owned model any other surface
+//! reads, never a tree of its own.
+//!
+//! A `read` command is `GET /v1/commands/<path>` with flags as query
+//! parameters; every other tier is `POST` with `{"flags": {}, "args":
+//! []}`. The same route plus `/stream` answers as `text/event-stream`.
+//! A command that is not invocable (no handler, hidden, management,
+//! builtin, interactive) is listed by discovery with its reason and is
+//! not mounted. The command's exit class selects the HTTP status; see
+//! [`status_for_exit_code`].
+
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::io::Write;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{HeaderMap, Method, Request};
+use axum::response::sse::Event;
+use axum::response::Response;
+use axum::routing::on;
+use axum::routing::MethodFilter;
+use axum::Router;
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+
+use crate::cli::{CommandInfo, FlagInfo, Root};
+use crate::output::EXIT_OK;
+
+use super::error::ApiError;
+use super::openapi::{OpenApi, Operation, Param, RequestBody, Response as OaResponse};
+
+/// The versioned mount point of the projection.
+pub const COMMAND_PROJECTION_PREFIX: &str = "/v1/commands";
+/// Appended to a command's route for its event-stream twin.
+pub const STREAM_SUFFIX: &str = "/stream";
+/// OpenAPI extension carrying the side-effect class.
+pub const EXT_SIDE_EFFECT: &str = "x-kit-side-effect";
+/// OpenAPI extension carrying where the class came from.
+pub const EXT_SIDE_EFFECT_SOURCE: &str = "x-kit-side-effect-source";
+
+/// Refusal codes for a command that did not run.
+pub const CODE_NOT_INVOCABLE: &str = "not_invocable";
+/// Policy refused a destructive command on this surface.
+pub const CODE_DESTRUCTIVE_BLOCKED: &str = "destructive_blocked";
+/// The permission gate refused the caller.
+pub const CODE_PERMISSION_DENIED: &str = "permission_denied";
+
+/// The projection's view of a command's side-effect tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SideEffectClass {
+    /// No observable state change.
+    Read,
+    /// Reversible mutation.
+    Write,
+    /// Irreversible mutation.
+    Destructive,
+    /// Session-bound; never served.
+    Interactive,
+}
+
+impl SideEffectClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            SideEffectClass::Read => "read",
+            SideEffectClass::Write => "write",
+            SideEffectClass::Destructive => "destructive",
+            SideEffectClass::Interactive => "interactive",
+        }
+    }
+}
+
+/// Whether the class is the adopter's word or kit's stand-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SideEffectSource {
+    /// The `kit/side-effect` annotation.
+    Declared,
+    /// A destructive-looking name.
+    Inferred,
+    /// Nothing declared; projected as write.
+    Unannotated,
+}
+
+impl SideEffectSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            SideEffectSource::Declared => "declared",
+            SideEffectSource::Inferred => "inferred",
+            SideEffectSource::Unannotated => "unannotated",
+        }
+    }
+}
+
+/// The HTTP method of a class: `GET` for read, `POST` otherwise.
+pub fn method_for(c: SideEffectClass) -> &'static str {
+    if c == SideEffectClass::Read {
+        "GET"
+    } else {
+        "POST"
+    }
+}
+
+/// `["widget","add"]` -> `/v1/commands/widget/add`.
+pub fn route_for(path: &[String]) -> String {
+    if path.is_empty() {
+        COMMAND_PROJECTION_PREFIX.to_string()
+    } else {
+        format!("{COMMAND_PROJECTION_PREFIX}/{}", path.join("/"))
+    }
+}
+
+/// `["widget","add"]` -> `commands_widget_add`.
+pub fn operation_id_for(path: &[String]) -> String {
+    if path.is_empty() {
+        "commands_discover".into()
+    } else {
+        format!("commands_{}", path.join("_").replace('-', "_"))
+    }
+}
+
+/// The HTTP status an exit code produces. Unmapped codes are 500.
+pub fn status_for_exit_code(code: i32) -> u16 {
+    match code {
+        0 => 200,
+        2 => 400,
+        3 => 404,
+        4 => 409,
+        5 | 7 => 403,
+        6 | 70 => 503,
+        64 => 429,
+        65 => 422,
+        _ => 500,
+    }
+}
+
+/// The exit-code to status table, ascending by code.
+pub fn exit_status_table() -> Vec<(i32, u16)> {
+    [0, 1, 2, 3, 4, 5, 6, 7, 64, 65, 70]
+        .into_iter()
+        .map(|c| (c, status_for_exit_code(c)))
+        .collect()
+}
+
+/// A projected flag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommandFlag {
+    /// Long name.
+    pub name: String,
+    /// pflag type name (`string`, `bool`, `int`, ...).
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// Usage string.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Default value.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default: String,
+    /// Whether the flag must be given.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    #[serde(skip)]
+    enum_values: Vec<String>,
+}
+
+/// A projected positional argument.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommandArg {
+    /// Name.
+    pub name: String,
+    /// Whether it must be given.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+}
+
+/// Everything the projection needs about one command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDescriptor {
+    /// The path below the root.
+    pub path: Vec<String>,
+    /// One-line description.
+    pub summary: String,
+    /// Long description.
+    pub description: String,
+    /// Resolved tier.
+    pub side_effect: SideEffectClass,
+    /// Where the tier came from.
+    pub source: SideEffectSource,
+    /// Declared flags.
+    pub flags: Vec<CommandFlag>,
+    /// Declared positionals.
+    pub args: Vec<CommandArg>,
+    /// Whether the command is mounted.
+    pub invocable: bool,
+    /// Why it is not, empty when it is.
+    pub reason: String,
+    /// The command is gated on confirmation (destructive, declared or
+    /// inferred, or annotated `kit/requires-confirmation`); a caller
+    /// may then pass `confirm`.
+    pub requires_confirmation: bool,
+    /// The command also needs a typed `confirm-token`.
+    pub requires_confirm_token: bool,
+    /// The `kit/side-effect` tier the policy engine reads: the declared
+    /// value, kit's destructive tier for a destructive-looking name, and
+    /// empty for a command declaring nothing.
+    pub tier: String,
+    /// The `kit/permissions` annotation, empty when undeclared.
+    pub permissions: String,
+}
+
+impl CommandDescriptor {
+    /// The HTTP method.
+    pub fn method(&self) -> &'static str {
+        method_for(self.side_effect)
+    }
+    /// The route.
+    pub fn route(&self) -> String {
+        route_for(&self.path)
+    }
+    /// The streaming route.
+    pub fn stream_route(&self) -> String {
+        format!("{}{STREAM_SUFFIX}", self.route())
+    }
+    /// The space-joined path.
+    pub fn name(&self) -> String {
+        self.path.join(" ")
+    }
+}
+
+/// The confirmation flag a gated command accepts from a caller.
+pub const CONFIRM_FLAG: &str = "confirm";
+/// The typed-token flag a `kit/destructive-token` command also accepts.
+pub const CONFIRM_TOKEN_FLAG: &str = "confirm-token";
+/// The values `confirm` documents.
+pub const CONFIRM_VALUES: [&str; 4] = ["yes", "no", "auto", "prompt"];
+
+/// The confirmation flags a caller may pass to `d`, empty when it is
+/// not gated. They are policy plumbing, not declared command flags, so
+/// the projection adds them for gated commands only; every other
+/// command keeps rejecting them as undeclared.
+pub fn confirm_flags_for(d: &CommandDescriptor) -> Vec<CommandFlag> {
+    if !d.requires_confirmation && !d.requires_confirm_token {
+        return Vec::new();
+    }
+    let mut out = vec![CommandFlag {
+        name: CONFIRM_FLAG.into(),
+        ty: "string".into(),
+        description: "Confirmation for this gated command: one of yes, no, auto, prompt.".into(),
+        default: String::new(),
+        required: false,
+        enum_values: CONFIRM_VALUES.iter().map(|v| v.to_string()).collect(),
+    }];
+    if d.requires_confirm_token {
+        out.push(CommandFlag {
+            name: CONFIRM_TOKEN_FLAG.into(),
+            ty: "string".into(),
+            description: "Typed confirmation token. The refusal message for a call without it \
+                          names the expected value."
+                .into(),
+            default: String::new(),
+            required: false,
+            enum_values: Vec::new(),
+        });
+    }
+    out
+}
+
+/// The descriptors of every command below the root, in tree order.
+pub fn descriptors(root: &Root) -> Vec<CommandDescriptor> {
+    let model = root.model();
+    let mut out = Vec::new();
+    model.walk(&mut |c| {
+        // The root and pure groups are not calls; alias shims are not commands.
+        // kit's own management commands (completion) are not part of
+        // the author's tree; neither are the root and pure groups.
+        let builtin = c
+            .path
+            .first()
+            .is_some_and(|top| root.command_group(top).is_some());
+        if !c.path.is_empty()
+            && !builtin
+            && c.commands.is_empty()
+            && !root.aliases().contains_key(&c.path_string())
+        {
+            out.push(describe(root, c));
+        }
+    });
+    out
+}
+
+fn describe(root: &Root, c: &CommandInfo) -> CommandDescriptor {
+    let (class, source) = match c.side_effect().filter(|t| !t.is_empty()) {
+        Some("read") => (SideEffectClass::Read, SideEffectSource::Declared),
+        Some(t) if t.starts_with("destructive") => {
+            (SideEffectClass::Destructive, SideEffectSource::Declared)
+        }
+        Some("interactive") => (SideEffectClass::Interactive, SideEffectSource::Declared),
+        Some(_) => (SideEffectClass::Write, SideEffectSource::Declared),
+        None if c.inferred_destructive() => {
+            (SideEffectClass::Destructive, SideEffectSource::Inferred)
+        }
+        None => (SideEffectClass::Write, SideEffectSource::Unannotated),
+    };
+    let reason = if root.command_group(&c.name).is_some() && c.path.len() == 1 {
+        "management-only"
+    } else if c.hidden {
+        "hidden-internal"
+    } else if class == SideEffectClass::Interactive {
+        "interactive"
+    } else if !c.invocable {
+        "not-runnable"
+    } else {
+        ""
+    };
+    let requires_token = matches!(
+        c.annotations
+            .get("kit/destructive-token")
+            .map(String::as_str),
+        Some("required" | "true")
+    );
+    let requires_confirmation = class == SideEffectClass::Destructive
+        || c.annotations
+            .get("kit/requires-confirmation")
+            .map(String::as_str)
+            == Some("true");
+    let mut flags: Vec<CommandFlag> = c
+        .flags
+        .iter()
+        .filter(|f| !f.hidden && !f.persistent && f.name != "help")
+        // The auto-registered token flag is advertised through
+        // confirm_flags_for, once.
+        .filter(|f| !(requires_token && f.name == CONFIRM_TOKEN_FLAG))
+        .map(flag_of)
+        .collect();
+    flags.sort_by(|a, b| a.name.cmp(&b.name));
+    CommandDescriptor {
+        path: c.path.clone(),
+        summary: c.short.clone(),
+        description: c.long.clone(),
+        side_effect: class,
+        source,
+        flags,
+        args: c
+            .args
+            .iter()
+            .map(|a| CommandArg {
+                name: a.name.clone(),
+                required: a.required,
+            })
+            .collect(),
+        invocable: reason.is_empty(),
+        reason: reason.to_string(),
+        requires_confirmation,
+        requires_confirm_token: requires_token,
+        tier: match source {
+            SideEffectSource::Declared => c.side_effect().unwrap_or_default().to_string(),
+            SideEffectSource::Inferred => crate::cli::model::INFERRED_TIER.to_string(),
+            SideEffectSource::Unannotated => String::new(),
+        },
+        permissions: c
+            .annotations
+            .get("kit/permissions")
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+fn flag_of(f: &FlagInfo) -> CommandFlag {
+    CommandFlag {
+        name: f.name.clone(),
+        ty: f.kind.type_name().to_string(),
+        description: f.usage.clone(),
+        default: f.default.clone().unwrap_or_default(),
+        required: f.required,
+        enum_values: f.enum_values.clone(),
+    }
+}
+
+/// A per-command gate: the caller's request headers and the command;
+/// `Err` refuses before the command runs.
+pub type Gate = dyn Fn(&CommandDescriptor, &HeaderMap) -> Result<(), ApiError> + Send + Sync;
+
+/// The projection of a kit CLI root onto HTTP.
+#[derive(Clone)]
+pub struct CommandProjection {
+    root: Arc<Root>,
+    tool: String,
+    version: String,
+    descriptors: Arc<Vec<CommandDescriptor>>,
+    gate: Option<Arc<Gate>>,
+    #[cfg(feature = "cli-permissions")]
+    served: Option<Arc<crate::cli::ServedGate>>,
+    policy: Option<String>,
+    max_ops: i64,
+}
+
+impl CommandProjection {
+    /// Projects `root`'s command tree as it stands now.
+    pub fn new(root: Arc<Root>, tool: &str, version: &str) -> Self {
+        let descriptors = Arc::new(descriptors(&root));
+        CommandProjection {
+            root,
+            tool: tool.into(),
+            version: version.into(),
+            descriptors,
+            gate: None,
+            #[cfg(feature = "cli-permissions")]
+            served: None,
+            policy: None,
+            max_ops: 0,
+        }
+    }
+
+    /// Fixes the delegation policy every call runs under (`--policy`).
+    /// Only the operator sets it: a caller naming a policy is refused.
+    pub fn with_policy(mut self, name: &str) -> Self {
+        self.policy = Some(name.to_string());
+        self
+    }
+
+    /// Sets the ceiling on mutating operations per call (`--max-ops`).
+    /// A caller may ask for fewer, never more, and cannot lift it.
+    pub fn with_max_ops(mut self, ceiling: i64) -> Self {
+        self.max_ops = ceiling.max(0);
+        self
+    }
+
+    /// Installs a per-command gate (policy, permission): a refusal is
+    /// its [`ApiError`], the command not run.
+    pub fn with_gate<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&CommandDescriptor, &HeaderMap) -> Result<(), ApiError> + Send + Sync + 'static,
+    {
+        self.gate = Some(Arc::new(f));
+        self
+    }
+
+    /// Evaluates a policy's served rules for every call, after the
+    /// command's decoded payload and before it runs (see
+    /// [`ServedGate`](crate::cli::ServedGate)): its `callers:` rules and
+    /// `max_ops` budgets, then its `permissions:` rules. The caller is
+    /// the one the stack's authentication established (`Claims` on the
+    /// request); an unauthenticated request is nobody. A refusal is 403
+    /// `permission_denied`, nothing run and nothing spent.
+    #[cfg(feature = "cli-permissions")]
+    pub fn with_served_gate(mut self, gate: Arc<crate::cli::ServedGate>) -> Self {
+        self.served = Some(gate);
+        self
+    }
+
+    /// The descriptors, in tree order.
+    pub fn descriptors(&self) -> &[CommandDescriptor] {
+        &self.descriptors
+    }
+
+    /// The discovery document: every command, invocable first.
+    pub fn discovery(&self) -> Value {
+        let mut cmds: Vec<Value> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        for d in self.descriptors.iter() {
+            let mut e = Map::new();
+            e.insert("path".into(), json!(d.path));
+            e.insert("name".into(), json!(d.name()));
+            if !d.summary.is_empty() {
+                e.insert("summary".into(), json!(d.summary));
+            }
+            e.insert("side_effect".into(), json!(d.side_effect.as_str()));
+            e.insert("side_effect_source".into(), json!(d.source.as_str()));
+            e.insert("invocable".into(), json!(d.invocable));
+            if d.invocable {
+                e.insert("method".into(), json!(d.method()));
+                e.insert("route".into(), json!(d.route()));
+                e.insert("stream_route".into(), json!(d.stream_route()));
+            } else {
+                e.insert("reason".into(), json!(d.reason));
+                if !d.reason.is_empty() && !reasons.contains(&d.reason) {
+                    reasons.push(d.reason.clone());
+                }
+            }
+            if !d.flags.is_empty() {
+                e.insert("flags".into(), json!(d.flags));
+            }
+            if d.requires_confirmation {
+                e.insert("requires_confirmation".into(), json!(true));
+            }
+            if !d.args.is_empty() {
+                e.insert("args".into(), json!(d.args));
+            }
+            cmds.push(Value::Object(e));
+        }
+        // invocable first, tree order kept within each group
+        cmds.sort_by_key(|c| !c["invocable"].as_bool().unwrap_or(false));
+        reasons.sort();
+        let mut doc = Map::new();
+        if !self.tool.is_empty() {
+            doc.insert("tool".into(), json!(self.tool));
+        }
+        if !self.version.is_empty() {
+            doc.insert("version".into(), json!(self.version));
+        }
+        doc.insert("prefix".into(), json!(COMMAND_PROJECTION_PREFIX));
+        doc.insert("commands".into(), Value::Array(cmds));
+        if !reasons.is_empty() {
+            doc.insert("reasons".into(), json!(reasons));
+        }
+        doc.insert(
+            "exit_status".into(),
+            Value::Array(
+                exit_status_table()
+                    .into_iter()
+                    .map(|(c, s)| json!({"exit_code": c, "status": s}))
+                    .collect(),
+            ),
+        );
+        Value::Object(doc)
+    }
+
+    /// The OpenAPI document of the projection: the discovery operation
+    /// and, per invocable command, its operation and its stream twin.
+    pub fn openapi(&self, title: &str, version: &str) -> OpenApi {
+        let mut api = OpenApi::new(title, version);
+        api.operation(Operation {
+            operation_id: operation_id_for(&[]),
+            method: "GET".into(),
+            path: COMMAND_PROJECTION_PREFIX.into(),
+            summary: "List every command, mounted or withheld".into(),
+            tags: vec!["commands".into()],
+            responses: BTreeMap::from([(
+                "200".into(),
+                OaResponse {
+                    description: "Command listing".into(),
+                    schema: Some(json!({"type": "object"})),
+                },
+            )]),
+            ..Operation::default()
+        });
+        for d in self.descriptors.iter().filter(|d| d.invocable) {
+            api.operation(command_operation(d, false));
+            api.operation(command_operation(d, true));
+        }
+        api
+    }
+
+    /// An axum router serving discovery and every invocable command
+    /// (and its `/stream` twin). Merge it into the adopter's routes
+    /// before [`ApiService::build`](super::ApiService::build): the
+    /// service's stack (auth, rate limit, body limit) then applies.
+    pub fn router(&self) -> Router {
+        let this = self.clone();
+        let mut r = Router::new().route(
+            COMMAND_PROJECTION_PREFIX,
+            on(MethodFilter::GET, move || {
+                let doc = this.discovery();
+                async move { super::error::json_response(200, &doc) }
+            }),
+        );
+        for d in self.descriptors.iter().filter(|d| d.invocable) {
+            let filter = if d.method() == "GET" {
+                MethodFilter::GET
+            } else {
+                MethodFilter::POST
+            };
+            for stream in [false, true] {
+                let (p, d2) = (self.clone(), d.clone());
+                let route = if stream { d.stream_route() } else { d.route() };
+                r = r.route(
+                    &route,
+                    on(filter, move |req: Request<Body>| {
+                        let (p, d) = (p.clone(), d2.clone());
+                        async move { p.serve(&d, req, stream).await }
+                    }),
+                );
+            }
+        }
+        r
+    }
+
+    async fn serve(&self, d: &CommandDescriptor, req: Request<Body>, stream: bool) -> Response {
+        if let Some(g) = &self.gate {
+            if let Err(e) = g(d, req.headers()) {
+                return e.into_response();
+            }
+        }
+        #[cfg(feature = "cli-permissions")]
+        let who = self.served.as_ref().map(|_| super::served::caller_of(&req));
+        let (parts, body) = req.into_parts();
+        let bytes = match axum::body::to_bytes(body, 1 << 20).await {
+            Ok(b) => b,
+            Err(e) => return bad_request(e.to_string()),
+        };
+        let Decoded {
+            mut argv,
+            max_ops: caller_max,
+            confirm,
+            args,
+            flags,
+        } = match decode(d, &parts.method, parts.uri.query(), &bytes) {
+            Ok(a) => a,
+            Err(m) => return bad_request(m),
+        };
+        #[cfg(feature = "cli-permissions")]
+        if let (Some(g), Some(who)) = (&self.served, who) {
+            if let Err(e) = super::served::admit(g, d, who, args, flags) {
+                return e.into_response();
+            }
+        }
+        #[cfg(not(feature = "cli-permissions"))]
+        let _ = (args, flags);
+        // Controls, ahead of the command's own flags. `--confirm` is an
+        // intent guard, not an authorization (authn, scopes and the
+        // projection's gate are): a caller of a gated command may pass
+        // it, as in Go. A call never prompts, though: the server's
+        // terminal is not the caller's, so only yes and auto approve and
+        // everything else (no, prompt, unrecognised, absent) is no.
+        let confirm = match confirm.as_deref().map(|c| c.trim().to_ascii_lowercase()) {
+            Some(c) if c == "yes" || c == "auto" => c,
+            _ => "no".to_string(),
+        };
+        let mut ops = vec![format!("--confirm={confirm}")];
+        if let Some(p) = &self.policy {
+            ops.push(format!("--policy={p}"));
+        }
+        let max = match (caller_max, self.max_ops) {
+            (Some(c), o) if c > 0 && o > 0 => c.min(o),
+            (Some(c), 0) if c > 0 => c,
+            (_, o) => o,
+        };
+        if max > 0 {
+            ops.push(format!("--max-ops={max}"));
+        }
+        // Ahead of the command path, so they bind to the root's
+        // persistent flags and never to a leaf-local flag of the same name.
+        argv.splice(0..0, ops);
+        let root = self.root.clone();
+        let mut full = vec![root.model().name];
+        full.extend(argv);
+        if stream {
+            return run_stream(root, full);
+        }
+        let joined = tokio::task::spawn_blocking(move || run_captured(&root, &full)).await;
+        match joined {
+            Ok(res) => {
+                let status = status_for_exit_code(res.exit_code);
+                super::error::json_response(status, &res.to_value())
+            }
+            Err(e) => ApiError::new(500, "server_error", e.to_string()).into_response(),
+        }
+    }
+}
+
+fn bad_request(msg: String) -> Response {
+    ApiError::new(400, "bad_request", msg).into_response()
+}
+
+struct Captured {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Captured {
+    fn to_value(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("exit_code".into(), json!(self.exit_code));
+        if let Ok(v @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(&self.stdout) {
+            m.insert("data".into(), v);
+        }
+        if !self.stdout.is_empty() {
+            m.insert("stdout".into(), json!(self.stdout));
+        }
+        if !self.stderr.is_empty() {
+            m.insert("stderr".into(), json!(self.stderr));
+        }
+        Value::Object(m)
+    }
+}
+
+fn run_captured(root: &Root, argv: &[String]) -> Captured {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let exit_code = match root.execute(argv, &mut out, &mut err) {
+        Ok(()) => EXIT_OK,
+        Err(e) => e.exit_code,
+    };
+    Captured {
+        exit_code,
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+    }
+}
+
+/// A `Write` that forwards each write to the event stream and keeps a
+/// copy for the final result.
+struct Tee {
+    tx: tokio::sync::mpsc::UnboundedSender<(&'static str, String)>,
+    kind: &'static str,
+    buf: Vec<u8>,
+}
+
+impl Write for Tee {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(b);
+        let _ = self
+            .tx
+            .send((self.kind, String::from_utf8_lossy(b).into_owned()));
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn run_stream(root: Arc<Root>, argv: Vec<String>) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, String)>();
+    let done = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut out = Tee {
+            tx: tx.clone(),
+            kind: "stdout",
+            buf: Vec::new(),
+        };
+        let mut err = Tee {
+            tx: tx.clone(),
+            kind: "stderr",
+            buf: Vec::new(),
+        };
+        let exit_code = match root.execute(&argv, &mut out, &mut err) {
+            Ok(()) => EXIT_OK,
+            Err(e) => e.exit_code,
+        };
+        let res = Captured {
+            exit_code,
+            stdout: String::from_utf8_lossy(&out.buf).into_owned(),
+            stderr: String::from_utf8_lossy(&err.buf).into_owned(),
+        };
+        let mut v = res.to_value();
+        v["status"] = json!(status_for_exit_code(exit_code));
+        let _ = done.send(("result", v.to_string()));
+    });
+    let events = futures_util::stream::unfold(Some(rx), |st| async move {
+        let mut rx = st?;
+        let (kind, data) = rx.recv().await?;
+        let last = kind == "result";
+        let ev = if last {
+            Event::default().event("result").data(data)
+        } else {
+            let payload = json!({"kind": kind, "data": data, "at": rfc3339_now()});
+            Event::default().event("event").data(payload.to_string())
+        };
+        Some((Ok::<_, Infallible>(ev), (!last).then_some(rx)))
+    });
+    super::sse::sse(events)
+}
+
+/// The current UTC time as RFC 3339 (seconds).
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// The root's delegation controls, by what a caller may do with them.
+/// `dry-run` only makes a call safer and is the caller's; `max-ops` may
+/// only tighten the operator's ceiling; `policy` is the operator's and
+/// a caller naming it is refused; `confirm` is an intent guard the
+/// caller of a gated command may pass (it binds to the root's flag,
+/// never a leaf-local one), and is refused on any other command.
+const CONTROL_FLAGS: &[&str] = &["confirm", "max-ops", "policy", "dry-run"];
+
+/// A decoded request: the argv tail and the caller's root controls.
+struct Decoded {
+    argv: Vec<String>,
+    max_ops: Option<i64>,
+    confirm: Option<String>,
+    /// The positionals the caller sent.
+    args: Vec<String>,
+    /// The command flags the caller set, by name.
+    flags: BTreeMap<String, Value>,
+}
+
+/// Builds the argv tail for a request, or the refusal text.
+fn decode(
+    d: &CommandDescriptor,
+    method: &Method,
+    query: Option<&str>,
+    body: &[u8],
+) -> Result<Decoded, String> {
+    // A gated command additionally accepts its confirmation flags (the
+    // declared set of every other command stays closed).
+    let gate_flags = confirm_flags_for(d);
+    let mut by_name: BTreeMap<&str, &CommandFlag> =
+        d.flags.iter().map(|f| (f.name.as_str(), f)).collect();
+    for f in &gate_flags {
+        by_name.insert(f.name.as_str(), f);
+    }
+    // One normalized map feeds both the argv the command runs with and
+    // the payload the served gate reads, so they cannot diverge.
+    let mut flags: BTreeMap<String, Value> = BTreeMap::new();
+    let mut args: Vec<String> = Vec::new();
+    for (k, v) in parse_query(query.unwrap_or("")) {
+        if k == "arg" {
+            args.push(v);
+            continue;
+        }
+        // A control is the root's whatever the leaf declares by that name.
+        let f = by_name
+            .get(k.as_str())
+            .copied()
+            .filter(|_| !CONTROL_FLAGS.contains(&k.as_str()));
+        let value = match f {
+            Some(f) => coerce(f, &v)?,
+            None if CONTROL_FLAGS.contains(&k.as_str()) => control_value(&k, &v),
+            None => continue,
+        };
+        put(&mut flags, f, k, value)?;
+    }
+    if method != Method::GET && !body.is_empty() {
+        let parsed: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+        if let Some(fm) = parsed.get("flags").and_then(Value::as_object) {
+            for (k, v) in fm {
+                let control = CONTROL_FLAGS.contains(&k.as_str());
+                let f = by_name.get(k.as_str()).copied().filter(|_| !control);
+                if f.is_none() && !control {
+                    return Err(format!("unknown flag: {k}"));
+                }
+                let v = match f {
+                    Some(f) => typed(f, v)?,
+                    None => v.clone(),
+                };
+                if v.is_null() {
+                    return Err(format!("{k}: null is not a flag value"));
+                }
+                // The body is the more explicit statement: it replaces
+                // the query's value (Go's rule), in the one map the
+                // command and the rules both read.
+                flags.insert(k.clone(), v);
+            }
+        }
+        if let Some(a) = parsed.get("args").and_then(Value::as_array) {
+            args = a
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect();
+        }
+    }
+    flags.retain(|_, v| *v != Value::Bool(false));
+    let need = d.args.iter().filter(|a| a.required).count();
+    if args.len() < need {
+        return Err(format!(
+            "missing required argument: {}",
+            d.args[args.len()].name
+        ));
+    }
+    let mut argv: Vec<String> = d.path.clone();
+    let mut caller_max = None;
+    let mut confirm = None;
+    let mut set: BTreeMap<String, Value> = BTreeMap::new();
+    for (k, v) in flags {
+        // Delegation controls are the root's whether or not the leaf
+        // also declares a flag of that name: a leaf-local `--confirm`
+        // must not shadow the root's gate, so a caller's confirm is
+        // carried to the root's flag, never to the leaf's.
+        match k.as_str() {
+            "policy" => return Err(format!("{k} is set by the operator, not the caller")),
+            "confirm" => {
+                if gate_flags.is_empty() {
+                    return Err(
+                        "confirm is accepted only by a command that requires confirmation"
+                            .to_string(),
+                    );
+                }
+                confirm = Some(scalar(&v));
+                continue;
+            }
+            "max-ops" => {
+                caller_max = Some(
+                    scalar(&v)
+                        .parse::<i64>()
+                        .map_err(|_| "max-ops must be an integer".to_string())?,
+                );
+                continue;
+            }
+            _ => {}
+        }
+        set.insert(k.clone(), v.clone());
+        match v {
+            Value::Bool(true) => argv.push(format!("--{k}")),
+            // A switch left off is a switch not set: the command is not
+            // told, and (the map being dropped of it first) neither are
+            // the rules.
+            Value::Bool(false) | Value::Null => {}
+            Value::Array(items) => {
+                for i in items {
+                    argv.push(format!("--{k}={}", scalar(&i)));
+                }
+            }
+            other => argv.push(format!("--{k}={}", scalar(&other))),
+        }
+    }
+    if !args.is_empty() {
+        argv.push("--".into());
+        argv.extend(args.iter().cloned());
+    }
+    Ok(Decoded {
+        argv,
+        max_ops: caller_max,
+        confirm,
+        args,
+        flags: set,
+    })
+}
+
+/// A control flag's value from the query: `dry-run` is a switch, the
+/// rest take their text.
+fn control_value(name: &str, raw: &str) -> Value {
+    if name == "dry-run" {
+        return Value::Bool(raw != "false");
+    }
+    Value::String(raw.to_string())
+}
+
+/// Stores `v` as flag `k`. A flag given twice is refused unless it is
+/// repeatable (`stringArray`), whose values accumulate, so the map is
+/// exactly what the command receives. `null` is never a value.
+fn put(
+    flags: &mut BTreeMap<String, Value>,
+    f: Option<&CommandFlag>,
+    k: String,
+    v: Value,
+) -> Result<(), String> {
+    if v.is_null() {
+        return Err(format!("{k}: null is not a flag value"));
+    }
+    let repeatable = f.is_some_and(|f| f.ty == "stringArray");
+    match flags.get_mut(&k) {
+        None => {
+            flags.insert(k, v);
+        }
+        Some(Value::Array(have)) if repeatable => match v {
+            Value::Array(more) => have.extend(more),
+            one => have.push(one),
+        },
+        Some(_) => return Err(format!("{k}: flag given more than once")),
+    }
+    Ok(())
+}
+
+/// A JSON body value checked against the flag's declared type: no
+/// coercion by accident, no arrays for a scalar flag.
+fn typed(f: &CommandFlag, v: &Value) -> Result<Value, String> {
+    let bad = |want: &str| Err(format!("{}: expected {want}", f.name));
+    match f.ty.as_str() {
+        "bool" => v
+            .is_boolean()
+            .then(|| v.clone())
+            .ok_or(())
+            .or_else(|_| bad("a boolean")),
+        "int" | "uint" | "count" => v
+            .as_i64()
+            .map(|n| json!(n))
+            .ok_or(())
+            .or_else(|_| bad("an integer")),
+        "float" => v
+            .is_number()
+            .then(|| v.clone())
+            .ok_or(())
+            .or_else(|_| bad("a number")),
+        "stringArray" => match v {
+            Value::String(_) => Ok(json!([v])),
+            Value::Array(items) if items.iter().all(Value::is_string) => Ok(v.clone()),
+            _ => bad("a string or an array of strings"),
+        },
+        _ => v
+            .is_string()
+            .then(|| v.clone())
+            .ok_or(())
+            .or_else(|_| bad("a string")),
+    }
+}
+
+fn scalar(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn coerce(f: &CommandFlag, raw: &str) -> Result<Value, String> {
+    Ok(match f.ty.as_str() {
+        "bool" => match raw {
+            "" => Value::Bool(true),
+            _ => Value::Bool(
+                raw.parse::<bool>()
+                    .map_err(|_| format!("{}: invalid boolean: {raw}", f.name))?,
+            ),
+        },
+        "int" | "uint" | "count" => json!(raw
+            .parse::<i64>()
+            .map_err(|_| format!("{}: invalid integer: {raw}", f.name))?),
+        "float" => json!(raw
+            .parse::<f64>()
+            .map_err(|_| format!("{}: invalid number: {raw}", f.name))?),
+        "stringArray" => json!(raw.split(',').collect::<Vec<_>>()),
+        _ => json!(raw),
+    })
+}
+
+fn parse_query(q: &str) -> Vec<(String, String)> {
+    q.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (pct(k), pct(v))
+        })
+        .collect()
+}
+
+fn pct(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 2;
+                }
+                Err(_) => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn flag_schema(f: &CommandFlag) -> Value {
+    let mut s = match f.ty.as_str() {
+        "bool" => json!({"type": "boolean"}),
+        "int" | "uint" | "count" => json!({"type": "integer"}),
+        "float" => json!({"type": "number"}),
+        "stringArray" => json!({"type": "array", "items": {"type": "string"}}),
+        _ => json!({"type": "string"}),
+    };
+    if !f.enum_values.is_empty() {
+        s["enum"] = json!(f.enum_values);
+    }
+    s
+}
+
+fn command_operation(d: &CommandDescriptor, stream: bool) -> Operation {
+    let arg_names = d
+        .args
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut op = Operation {
+        operation_id: if stream {
+            format!("stream_{}", operation_id_for(&d.path))
+        } else {
+            operation_id_for(&d.path)
+        },
+        method: d.method().into(),
+        path: if stream { d.stream_route() } else { d.route() },
+        summary: if d.summary.is_empty() {
+            format!("Invoke {}", d.name())
+        } else {
+            d.summary.clone()
+        },
+        description: d.description.clone(),
+        tags: vec!["commands".into()],
+        extensions: BTreeMap::from([
+            (EXT_SIDE_EFFECT.into(), json!(d.side_effect.as_str())),
+            (EXT_SIDE_EFFECT_SOURCE.into(), json!(d.source.as_str())),
+        ]),
+        ..Operation::default()
+    };
+    // Declared flags, then a gated command's confirmation flags (which
+    // replace a leaf-local flag of the same name: the call binds to the
+    // root's).
+    let gate = confirm_flags_for(d);
+    let flags: Vec<&CommandFlag> = d
+        .flags
+        .iter()
+        .filter(|f| !gate.iter().any(|g| g.name == f.name))
+        .chain(gate.iter())
+        .collect();
+    if d.method() == "GET" {
+        for f in flags.iter().copied() {
+            op.parameters.push(Param {
+                name: f.name.clone(),
+                location: "query".into(),
+                required: f.required,
+                description: f.description.clone(),
+                schema: Some(flag_schema(f)),
+            });
+        }
+        if !d.args.is_empty() {
+            op.parameters.push(Param {
+                name: "arg".into(),
+                location: "query".into(),
+                required: d.args.iter().any(|a| a.required),
+                description: format!("Positional argument; repeat in order: {arg_names}"),
+                schema: Some(json!({"type": "array", "items": {"type": "string"}})),
+            });
+        }
+    } else {
+        let props: Map<String, Value> = flags
+            .iter()
+            .map(|f| (f.name.clone(), flag_schema(f)))
+            .collect();
+        let required: Vec<&str> = flags
+            .iter()
+            .filter(|f| f.required)
+            .map(|f| f.name.as_str())
+            .collect();
+        let mut flags_schema = json!({"type": "object", "properties": props});
+        if !required.is_empty() {
+            flags_schema["required"] = json!(required);
+        }
+        op.request_body = Some(RequestBody {
+            description: "Command flags and positional arguments".into(),
+            required: !required.is_empty() || d.args.iter().any(|a| a.required),
+            schema: Some(json!({"type": "object", "properties": {
+                "flags": flags_schema,
+                "args": {"type": "array", "items": {"type": "string"}, "description": arg_names},
+            }})),
+        });
+    }
+    let err = json!({"type": "object", "properties": {
+        "status": {"type": "integer"}, "code": {"type": "string"}, "message": {"type": "string"}}});
+    let result = json!({"type": "object", "properties": {
+        "exit_code": {"type": "integer"}, "data": {}, "stdout": {"type": "string"}, "stderr": {"type": "string"}}});
+    if stream {
+        op.responses.insert(
+            "200".into(),
+            OaResponse {
+                description: "text/event-stream of event and result frames".into(),
+                schema: None,
+            },
+        );
+    } else {
+        op.responses.insert(
+            "200".into(),
+            OaResponse {
+                description: "Command completed".into(),
+                schema: Some(result),
+            },
+        );
+    }
+    for (code, desc) in [
+        ("400", "Malformed request, or the command exited USAGE"),
+        (
+            "403",
+            "Refused by policy, or the command exited UNAUTHORIZED",
+        ),
+        ("500", "Command failed"),
+    ] {
+        op.responses.insert(
+            code.into(),
+            OaResponse {
+                description: desc.into(),
+                schema: Some(err.clone()),
+            },
+        );
+    }
+    op
+}
+
+/// Maps a command refusal that never ran (gate) to its API error.
+pub fn refusal(code: &str, message: &str) -> ApiError {
+    let status = match code {
+        CODE_NOT_INVOCABLE => 404,
+        _ => 403,
+    };
+    ApiError::new(status, code, message)
+}

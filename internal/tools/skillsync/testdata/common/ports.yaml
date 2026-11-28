@@ -1,0 +1,86 @@
+docs:
+  repo: acme/mono
+  branch: next
+host: https://example.test
+mirror_branch: main
+author:
+  name: acme
+  url: https://example.test/acme
+category: development
+keywords: [acme, kit]
+reference_column: Go
+
+marketplace:
+  name: acme-market
+  repo: acme/skillset
+
+# The binary the router and the reference port skill version-check.
+binary:
+  command: kit
+  upgrade: brew upgrade acme/tap/kit
+  readme: cmd/kit/README.md
+
+router:
+  skill: acme-kit
+  component: kit
+  min_version: 1.4.0-beta.2
+  keywords: [router]
+ports:
+  - component: kit
+    skill: acme-kit-go
+    column: Go
+    language: Go
+    install: go get acme.test/kit
+    package: acme.test/kit
+    tier: reference
+    toolchain: Go 1.27
+    min_version: 1.4.0-beta.2
+    installed: ["go list -m acme.test/kit"]
+    upgrade: go get acme.test/kit@latest
+    keywords: [go]
+  - component: kit-ts
+    skill: acme-kit-ts
+    column: TS
+    language: TypeScript
+    install: pnpm add @acme/kit
+    toolchain: Node 22.12+
+    min_version: 0.3.0-alpha.4
+    installed: ["npm ls @acme/kit", "pnpm ls @acme/kit"]
+    upgrade: pnpm add @acme/kit@latest
+    keywords: [typescript]
+  - component: kit-py
+    skill: acme-kit-py
+    column: Py
+    language: Python
+    install: pip install acme-kit
+    toolchain: Python 3.11+
+    min_version: 0.3.0-alpha.2
+    installed: ["pip show acme-kit", "uv pip show acme-kit"]
+    upgrade: pip install -U --pre acme-kit
+    installed_note: "Python may print the PEP 440 spelling (a, b, rc for -alpha., -beta., -rc.)"
+    keywords: [python]
+  - component: kit-rs
+    skill: acme-kit-rs
+    column: Rust
+    language: Rust
+    install: cargo add acme-kit
+    toolchain: Rust 1.89+
+    min_version: 0.3.0-alpha.3
+    installed: ["cargo tree -i acme-kit --depth 0"]
+    upgrade: cargo update -p acme-kit
+    keywords: [rust]
+  - component: kit-php
+    skill: acme-kit-php
+    column: PHP
+    language: PHP
+    install: composer require acme/kit
+    toolchain: PHP 8.4+
+    min_version: 0.3.0-alpha.1
+    installed: ["composer show acme/kit"]
+    upgrade: composer update acme/kit
+    keywords: [php]
+no_skill: [tasks]
+copies:
+  - from: skills/acme-kit/scripts/detect.sh
+    to: scripts/detect.sh
+    skills: [ports]

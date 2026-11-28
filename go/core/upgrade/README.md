@@ -1,0 +1,80 @@
+# upgrade
+
+Versioned state migrations and self-update for kit binaries.
+
+`Checker` polls release feeds, downloads upgrade artifacts, verifies them,
+and replaces the running binary; lifecycle events go to the kit bus when
+`WithPublisher` is wired.
+
+## Default topics
+
+| Topic                              | When |
+|------------------------------------|------|
+| `kit.core.upgrade.released`        | Check observes a new latest version |
+| `kit.core.upgrade.downloaded`      | Upgrade fetched the asset successfully |
+| `kit.core.upgrade.installed`       | Upgrade replaced the running binary |
+| `kit.core.upgrade.snoozed`         | user deferred notification |
+
+Without `WithPublisher` the checker is silent on the bus (opt-in).
+
+## Adopter rebrand
+
+```go
+import "hop.top/kit/go/core/upgrade"
+
+c := upgrade.New(
+    upgrade.WithPublisher(pub),
+    upgrade.WithTopicPrefix("myapp.core.upgrade"),
+)
+// emits: myapp.core.upgrade.{released,downloaded,installed,snoozed}
+```
+
+`WithTopics` overrides individual actions; empty fields keep the default.
+Publishing is best-effort on a goroutine; it never blocks or fails the flow.
+
+## Migrations
+
+`Migrator.Run(ctx)` brings each `SchemaDriver` from its stored version
+to the target: backup, then per pending migration in semver order `Up`,
+`Verify` and a record of its version, then the `WithVerify` final check.
+A crash between an `Up` and its record re-applies that migration on the
+next run: keep migrations idempotent. A failure (`ErrVerify` for checks,
+`context.Canceled` between steps, a refused `SetVersion`) rolls back:
+`Down`s newest first, each followed by a record of the version before it,
+else the backup, then a record of the starting version. A failed `Up`
+counts as applied but is never downed: the backup is restored at once, no
+`Down` runs. Manual mode leaves the last applied version; the backup keeps
+the starting version beside it (`pre-<v>.version`) so `RollbackLatest`
+records it after `Restore`. A `VersionStorer` keeps its own version: only
+`SetVersion` is called, no version file. A non-empty `WithBaseline` answer for a store reporting `""` is recorded
+(`kit.core.migration.baselined`); an error fails the schema. A `Locker`
+driver (`Lock(ctx) (unlock func() error, err error)`) is locked before
+`Version()` and unlocked once its run ends, rollback included;
+`RollbackLatest` locks it too (no `Version()` read). A `Lock` error fails
+the schema (`lock: ...`), an unlock error is logged. A `Backup` that
+returns `ErrBackupUnsupported` runs without a backup (no directory, no
+prune); a rollback that then needs a restore (a failed `Up` always does),
+or whose `Restore` returns it, reverts nothing: the error matches
+`ErrNotRestored` (cause kept, no `reverted` event), the version stays at
+the last step still applied; `RollbackLatest` with no backup fails alike.
+
+| Option | Effect |
+|--------|--------|
+| `WithRegistry(NewRegistry())` | own migrations; default: `RegisterMigration`'s registry |
+| `WithDataDir(dir)` | version files and backups under `dir`, not XDG |
+| `WithVerify(fn)` | final-state check per schema |
+| `WithBaseline(fn)` | version of a store that reports none |
+| `WithEventPublisher(p)` | `kit.core.migration.*` events, in order |
+| `WithManualRollback()`, `WithBackupRetention(n)` | no auto rollback; backups kept |
+
+`MigrateDocument` (and `MigrateDocumentMap`) migrates one JSON document
+in memory by its integer version field: `DocStep{From, To, Apply,
+Verify, Note}` as in `config.Migration`; refuses newer documents; on
+error the input is untouched. Keys come back sorted. Parity:
+[`contracts/upgrade-v1`](../../../contracts/upgrade-v1/README.md)
+(`make test-parity-upgrade`); Rust: `hop_top_kit::upgrade`.
+
+## Sub-packages
+
+- [`driver/`](driver/README.md): `upgrade.SchemaDriver` backends, which store holds the schema version and how it is backed up.
+- [`skill/`](skill/README.md): renders the agent skill text that keeps a tool's binary current.

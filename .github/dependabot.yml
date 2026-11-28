@@ -1,0 +1,188 @@
+# Org policy (hop-top/.github templates/dependabot.yml).
+#
+# Version updates: one PR at a time across every ecosystem. All entries join
+#   the `dependencies` multi-ecosystem group (open-pull-requests-limit 1);
+#   while its PR is open, Dependabot updates that PR instead of opening
+#   another. It carries majors too, unless an `ignore` below holds them.
+#   Sets that must move together (otel api/sdk/exporters, MCP server and
+#   core, vitest/vite, typescript-eslint, RustCrypto) therefore land in
+#   the same PR. Weekly, Monday 06:00.
+# Cooldown: a new release is proposed only once it is 14 days old (the
+#   dependency age gate). Owned packages are excluded, as they are from
+#   the age gate. It holds back version updates only.
+# Security updates: immediate (cooldown never applies); one grouped PR per
+#   ecosystem. Needs the repo setting "Dependabot security updates".
+# rebase-strategy disabled: an open PR is not rebased, and its CI not
+#   re-run, each time next moves. Comment `@dependabot rebase` on a PR to
+#   refresh it. This applies to security PRs as well.
+# Schedule, PR limit and commit prefix live on the group; a group-only key
+#   on an entry is a configuration error.
+version: 2
+
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "build(deps):"
+
+updates:
+  # Root module plus the two nested modules.
+  # otelconnect pins an exact otel release and a connect floor; the otel
+  # api, sdk and exporters must share a version.
+  - package-ecosystem: gomod
+    directories:
+      - "/"
+      - "/extensions/mcp-tasks"
+      - "/incubator/qmochi"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["hop.top/*", "github.com/hop-top/*"]
+    rebase-strategy: disabled
+    groups:
+      go-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # "/" is the pnpm workspace: its lockfile covers sdk/ts,
+  # engine/sdk/ts-kit-engine and examples/spaced/ts. The other directories
+  # are standalone examples outside it (package-lock.json or none).
+  # @modelcontextprotocol/* server pins core exactly; vitest peers on vite and
+  # @vitest/* ship in lockstep with it; typescript-eslint and
+  # @typescript-eslint/* ship in lockstep; esbuild is pinned by vite's range.
+  - package-ecosystem: npm
+    directories:
+      - "/"
+      - "/examples/notebook-ts"
+      - "/examples/probe/ts"
+      - "/examples/spaced/web"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["@hop-top/*"]
+    rebase-strategy: disabled
+    ignore:
+      # TypeScript 7 (native compiler) has no classic JS API; typescript-eslint
+      # (peer <6.1) and tsup's dts build cannot run on it yet. Lift once
+      # typescript-eslint supports 7 and the dts build works.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # v5 changes load semantics (empty docs throw, `<<` merge keys,
+      # timestamps); needs a migration, not a bump.
+      - dependency-name: js-yaml
+        update-types: ["version-update:semver-major"]
+      # v13 segfaults on Node 22.12-22.13 (darwin-arm64) and still needs
+      # node-gyp on Windows; revisit once upstream fixes land.
+      - dependency-name: better-sqlite3
+        update-types: ["version-update:semver-major"]
+      # Typings track the better-sqlite3 major deferred above.
+      - dependency-name: "@types/better-sqlite3"
+        update-types: ["version-update:semver-major"]
+      # Typings track the Node major in mise.toml, moved by hand with the
+      # pin. They type APIs the engines floor (>=22.12 in sdk/ts and
+      # ts-kit-engine) may lack; the Node-floor CI job guards that.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # mcp pins mcp-types exactly: they must move together.
+  - package-ecosystem: uv
+    directories:
+      - "/sdk/py"
+      - "/engine/sdk/py-kit-engine"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["hop-top-*"]
+    rebase-strategy: disabled
+    ignore:
+      # ruff is a mise tool: the locked ruff must equal the mise.toml pin
+      # (toolchain-parity). Moved by hand with the pin, never alone.
+      - dependency-name: ruff
+    groups:
+      uv-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # The cross-lang runner builds against the SDK by path and shares its
+  # serde_json and tokio requirements. RustCrypto hash/KDF/MAC crates
+  # (sha2, hkdf, digest, hmac) share the `digest` major: bump together.
+  - package-ecosystem: cargo
+    directories:
+      - "/sdk/rs"
+      - "/sdk/tests/cross-lang/runners/rs"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["hop-top-*"]
+    rebase-strategy: disabled
+    ignore:
+      # Stay on stable releases of the secretbox AEAD.
+      - dependency-name: crypto_secretbox
+        versions: [">= 0.2.0-pre.0, < 0.2.0"]
+    groups:
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # Example apps: pyproject.toml without a uv.lock.
+  - package-ecosystem: pip
+    directories:
+      - "/examples/probe/py"
+      - "/examples/spaced/py"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["hop-top-*"]
+    rebase-strategy: disabled
+    groups:
+      pip-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: composer
+    directory: "/sdk/experimental/php"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["hop-top/*"]
+    rebase-strategy: disabled
+    groups:
+      composer-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # Workflow and composite-action `uses:` refs: every one is pinned to a
+  # commit SHA with its version in a trailing comment (make
+  # lint-actions-pinned); Dependabot moves the SHA and the comment together.
+  - package-ecosystem: github-actions
+    directories: ["/", "/.github/actions/*"]
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 14
+      exclude: ["hop-top/*"]
+    rebase-strategy: disabled
+    ignore:
+      # The release-please pin must match `tooling-ref` and the preflight
+      # pin (see release-please.yml); moved by hand, all three together.
+      # Reusable workflows are named by their path, so match those too.
+      - dependency-name: "hop-top/.github"
+      - dependency-name: "hop-top/.github/.github/workflows/release-please-*"
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]

@@ -1,0 +1,803 @@
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::backup::{Backups, LatestError, DEFAULT_RETENTION};
+use super::events::{MigrationPublisher, MigrationTopics, Payload, SOURCE};
+use super::lock::Held;
+use super::rollback::{roll_back, take_backup, BackupState};
+use super::unsupported::{is_backup_unsupported, is_not_restored, NotRestored};
+use super::{fs_util, pending, BoxError, Migration, SchemaDriver};
+use crate::bus::{Context, Event, Topic};
+
+/// Which part of a migration stopped a run. Go tells them apart with
+/// `errors.Is(err, ErrVerify)` and `errors.Is(err, context.Canceled)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    /// The migration's `up` failed. It counts as applied but is never
+    /// downed: the rollback restores the backup (no backup: not restored).
+    Up,
+    /// The migration's `verify` failed.
+    Verify,
+    /// The migration's version could not be recorded (version file or
+    /// driver `set_version`), after its `up` completed.
+    Record,
+    /// The migrator's final verify failed.
+    FinalVerify,
+    /// The context was done before the migration's `up`.
+    Canceled,
+}
+
+impl StepKind {
+    fn stage(self) -> &'static str {
+        match self {
+            StepKind::Up => "up",
+            StepKind::Verify => "verify",
+            StepKind::Record => "record",
+            StepKind::FinalVerify => "final",
+            StepKind::Canceled => "canceled",
+        }
+    }
+}
+
+fn step_text(
+    kind: StepKind,
+    version: &str,
+    source: &BoxError,
+    rollback: &Option<BoxError>,
+) -> String {
+    let head = match kind {
+        StepKind::Up => format!("up {version} failed"),
+        StepKind::Verify => format!("verify {version} failed"),
+        StepKind::Record => format!("record {version} failed"),
+        StepKind::FinalVerify => format!("final verify {version} failed"),
+        StepKind::Canceled => format!("up {version} canceled"),
+    };
+    match rollback {
+        Some(r) => format!("{head}: {source} (rollback also failed: {r})"),
+        None => format!("{head}: {source}"),
+    }
+}
+
+/// What a [`Migrator`] run or rollback failed on. The texts match Go's.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateError {
+    /// The driver's lock could not be taken (its error, or the context's
+    /// when it was done while waiting); nothing else ran for the schema.
+    #[error("migrate {schema}: lock: {source}")]
+    Lock { schema: String, source: BoxError },
+    #[error("migrate {schema}: read version: {source}")]
+    ReadVersion { schema: String, source: BoxError },
+    #[error("migrate {schema}: prepare backup: create backup dir: {source}")]
+    PrepareBackup { schema: String, source: io::Error },
+    #[error("migrate {schema}: prepare backup: write pre-run version: {source}")]
+    SavePreRun { schema: String, source: io::Error },
+    /// The baseline function failed, or its answer could not be recorded.
+    #[error("migrate {schema}: baseline: {source}")]
+    Baseline { schema: String, source: BoxError },
+    #[error("migrate {schema}: backup: {source}")]
+    Backup { schema: String, source: BoxError },
+    /// A migration step stopped the run (a refused version record
+    /// included). With auto-rollback the schema was rolled back, unless
+    /// `rollback` says how that failed too ([`NotRestored`] when nothing
+    /// could restore the schema).
+    #[error("migrate {schema}: {}", step_text(*.kind, .version, .source, .rollback))]
+    Step {
+        schema: String,
+        kind: StepKind,
+        /// The version being attempted (the last one for a final verify).
+        version: String,
+        source: BoxError,
+        rollback: Option<BoxError>,
+    },
+    #[error("rollback: only available in manual rollback mode")]
+    RollbackUnavailable,
+    #[error("rollback {schema}: {source}")]
+    Rollback { schema: String, source: BoxError },
+}
+
+impl MigrateError {
+    /// The step kind, for [`MigrateError::Step`].
+    pub fn step_kind(&self) -> Option<StepKind> {
+        match self {
+            MigrateError::Step { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// The rollback restored nothing: a `down` was missing or failed and
+    /// the backup was not taken or its `restore` is unsupported (or
+    /// `rollback_latest` found no backup). The stored version stays at the
+    /// last step still applied. Go `errors.Is(err, ErrNotRestored)`.
+    pub fn is_not_restored(&self) -> bool {
+        self.rollback_error().is_some_and(is_not_restored)
+    }
+
+    /// A [`BackupUnsupported`](super::BackupUnsupported) sits in the
+    /// rollback's cause chain. Go `errors.Is(err, ErrBackupUnsupported)`.
+    pub fn is_backup_unsupported(&self) -> bool {
+        self.rollback_error().is_some_and(is_backup_unsupported)
+    }
+
+    fn rollback_error(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MigrateError::Step { rollback, .. } => rollback.as_deref().map(|e| e as _),
+            MigrateError::Rollback { source, .. } => Some(&**source),
+            _ => None,
+        }
+    }
+
+    /// A verify (per migration or final) failed. Go `errors.Is(err, ErrVerify)`.
+    pub fn is_verify(&self) -> bool {
+        matches!(
+            self.step_kind(),
+            Some(StepKind::Verify | StepKind::FinalVerify)
+        )
+    }
+
+    /// The context was done between steps. Go `errors.Is(err, context.Canceled)`.
+    pub fn is_canceled(&self) -> bool {
+        self.step_kind() == Some(StepKind::Canceled)
+    }
+}
+
+/// The final-state check behind [`FinalVerifyFn`].
+pub type FinalVerify = dyn Fn(&Context, &str, &str) -> Result<(), BoxError> + Send + Sync;
+
+/// Final-state check: `(ctx, schema, version)`. Go `WithVerify`.
+pub type FinalVerifyFn = Arc<FinalVerify>;
+
+/// The baseline function behind [`BaselineFn`].
+pub type Baseline = dyn Fn(&Context, &str) -> Result<String, BoxError> + Send + Sync;
+
+/// Says what an unversioned schema is already at: `(ctx, schema)`.
+/// Go `WithBaseline`.
+pub type BaselineFn = Arc<Baseline>;
+
+/// Receives warnings (a failed backup prune). Defaults to stderr, as Go's `log.Printf`.
+pub type WarnFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A migration applied in this session. Go `AppliedMigration`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMigration {
+    pub version: String,
+    pub schema: String,
+}
+
+/// Migration state of one schema. Go `SchemaStatus`.
+#[derive(Debug)]
+pub struct SchemaStatus {
+    pub schema: String,
+    /// Stored version; `""` when none, or when reading it failed.
+    pub current: String,
+    pub target: String,
+    pub pending: usize,
+    /// Why the stored version could not be read.
+    pub error: Option<BoxError>,
+}
+
+/// Runs versioned migrations across schema drivers. Go `Migrator`.
+///
+/// Per driver, in the order added: take its lock when it has one
+/// ([`SchemaDriver::as_locker`], held until that schema's run ends), read the stored version, collect the
+/// pending migrations up to the target, back up into
+/// `pre-<first pending version>` (saving the version the run starts at
+/// beside it), then per migration apply `up`, its `verify`, and record
+/// that migration's version (the version file `<data dir>/<schema>/version`,
+/// then the driver; a driver with
+/// [`stores_version`](SchemaDriver::stores_version) gets no file), and
+/// finally run the [`verify`](Self::verify) check. A crash between an
+/// `up` and its record re-applies that one migration next run, so keep
+/// migrations idempotent. A failed step (a refused record included), or
+/// a context done before the next `up`, stops the run; with
+/// auto-rollback (the default) the applied migrations' `down`s run newest
+/// first, each followed by a record of the version before it, and the
+/// backup is restored instead, then the starting version recorded, as
+/// soon as one is missing or fails.
+pub struct Migrator {
+    tool: String,
+    version: String,
+    data_dir: Option<PathBuf>,
+    auto_rollback: bool,
+    retention: usize,
+    migrations: Vec<Migration>,
+    drivers: Vec<Box<dyn SchemaDriver>>,
+    history: Vec<AppliedMigration>,
+    verify: Option<FinalVerifyFn>,
+    baseline: Option<BaselineFn>,
+    publisher: Option<Arc<dyn MigrationPublisher>>,
+    topics: MigrationTopics,
+    warn: WarnFn,
+}
+
+impl fmt::Debug for Migrator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let drivers: Vec<&str> = self.drivers.iter().map(|d| d.name()).collect();
+        f.debug_struct("Migrator")
+            .field("tool", &self.tool)
+            .field("version", &self.version)
+            .field("data_dir", &self.data_dir)
+            .field("auto_rollback", &self.auto_rollback)
+            .field("retention", &self.retention)
+            .field("migrations", &self.migrations)
+            .field("drivers", &drivers)
+            .field("history", &self.history)
+            .field("verify", &self.verify.is_some())
+            .field("baseline", &self.baseline.is_some())
+            .field("publisher", &self.publisher.is_some())
+            .field("topics", &self.topics)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `<data home>/hop/<tool>`, where a [`Migrator`] keeps version files and
+/// backups unless [`Migrator::data_dir`] says otherwise.
+pub fn default_data_dir(tool: &str) -> PathBuf {
+    crate::xdg::data_home().join("hop").join(tool)
+}
+
+/// The version recorded for `schema` under `data_dir`, trimmed; `""`
+/// when there is no version file.
+pub fn read_version_file_in(data_dir: &Path, schema: &str) -> io::Result<String> {
+    match fs::read_to_string(data_dir.join(schema).join("version")) {
+        Ok(s) => Ok(s.trim().to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`read_version_file_in`] under [`default_data_dir`]. Go `ReadVersionFile`.
+pub fn read_version_file(tool: &str, schema: &str) -> io::Result<String> {
+    read_version_file_in(&default_data_dir(tool), schema)
+}
+
+impl Migrator {
+    /// A migrator for `tool` up to `version` (a leading `v` is dropped).
+    pub fn new(tool: impl Into<String>, version: &str) -> Migrator {
+        Migrator {
+            tool: tool.into(),
+            version: version.strip_prefix('v').unwrap_or(version).to_string(),
+            data_dir: None,
+            auto_rollback: true,
+            retention: DEFAULT_RETENTION,
+            migrations: Vec::new(),
+            drivers: Vec::new(),
+            history: Vec::new(),
+            verify: None,
+            baseline: None,
+            publisher: None,
+            topics: MigrationTopics::default(),
+            warn: Arc::new(|w| eprintln!("{w}")),
+        }
+    }
+
+    /// Checks each schema's final state after its last pending migration
+    /// is recorded. A failure rolls back every migration applied to that
+    /// schema in the run and records the version the run started at. Go
+    /// `WithVerify`.
+    pub fn verify(
+        mut self,
+        f: impl Fn(&Context, &str, &str) -> Result<(), BoxError> + Send + Sync + 'static,
+    ) -> Migrator {
+        self.verify = Some(Arc::new(f));
+        self
+    }
+
+    /// Sets what an unversioned store is already at. When a driver's
+    /// `version()` is `""`, `f(ctx, schema)` is called before pending
+    /// migrations are selected. A non-empty answer is recorded like any
+    /// version (event `baselined`) and used as the stored version, so
+    /// the migrations at or below it are not applied; `""` leaves the
+    /// store unversioned. An error fails that schema's run
+    /// ([`MigrateError::Baseline`]) before any backup or `up`. `f` is not
+    /// called when a version is stored or reading it failed, and
+    /// [`status`](Self::status) never calls it. Go `WithBaseline`.
+    pub fn baseline(
+        mut self,
+        f: impl Fn(&Context, &str) -> Result<String, BoxError> + Send + Sync + 'static,
+    ) -> Migrator {
+        self.baseline = Some(Arc::new(f));
+        self
+    }
+
+    /// Publishes lifecycle events to `p` (a kit bus, or a closure),
+    /// synchronously and in order. Without one a migrator is silent. Go
+    /// `WithEventPublisher`.
+    pub fn publisher(mut self, p: impl MigrationPublisher + 'static) -> Migrator {
+        self.publisher = Some(Arc::new(p));
+        self
+    }
+
+    /// Replaces the event topics; see [`MigrationTopics::from_prefix`]
+    /// and [`MigrationTopics::or_default`].
+    pub fn topics(mut self, topics: MigrationTopics) -> Migrator {
+        self.topics = topics;
+        self
+    }
+
+    /// Receives warnings instead of stderr.
+    pub fn on_warning(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Migrator {
+        self.warn = Arc::new(f);
+        self
+    }
+
+    /// No rollback on failure; call [`rollback_latest`](Self::rollback_latest).
+    /// Go `WithManualRollback`.
+    pub fn manual_rollback(mut self) -> Migrator {
+        self.auto_rollback = false;
+        self
+    }
+
+    /// Backups kept per schema after a successful run; 0 means the
+    /// default, 5. Go `WithBackupRetention`.
+    pub fn backup_retention(mut self, n: usize) -> Migrator {
+        self.retention = n;
+        self
+    }
+
+    /// Keeps version files and backups under `dir` instead of
+    /// [`default_data_dir`].
+    pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Migrator {
+        self.data_dir = Some(dir.into());
+        self
+    }
+
+    /// Adds a migration. Go `RegisterMigration`, scoped to this migrator.
+    pub fn register(&mut self, m: Migration) {
+        self.migrations.push(m);
+    }
+
+    /// Adds a schema driver; drivers run in the order added.
+    pub fn add_driver(&mut self, d: impl SchemaDriver + 'static) {
+        self.drivers.push(Box::new(d));
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// The target version, without a leading `v`.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The directory holding version files and backups.
+    pub fn resolved_data_dir(&self) -> PathBuf {
+        self.data_dir
+            .clone()
+            .unwrap_or_else(|| default_data_dir(&self.tool))
+    }
+
+    /// Migrations applied by this migrator, in order. A migration rolled
+    /// back after a later failure stays listed, as in Go.
+    pub fn history(&self) -> &[AppliedMigration] {
+        &self.history
+    }
+
+    /// Stored version and pending count per driver.
+    pub fn status(&self) -> Vec<SchemaStatus> {
+        self.drivers
+            .iter()
+            .map(|d| {
+                let (current, error) = match d.version() {
+                    Ok(v) => (v, None),
+                    Err(e) => (String::new(), Some(e)),
+                };
+                SchemaStatus {
+                    schema: d.name().to_string(),
+                    pending: pending(&self.migrations, d.name(), &current, &self.version).len(),
+                    current,
+                    target: self.version.clone(),
+                    error,
+                }
+            })
+            .collect()
+    }
+
+    /// Runs pending migrations for every driver; stops at the first
+    /// failing one, or before the next `up` once `ctx` is done.
+    /// Re-running after success applies nothing. Go `Run`.
+    pub fn run(&mut self, ctx: &Context) -> Result<(), MigrateError> {
+        let start = Instant::now();
+        let ev = Emitter {
+            tool: &self.tool,
+            publisher: self.publisher.as_deref(),
+            topics: &self.topics,
+        };
+        ev.emit(
+            &ev.topics.run_started,
+            ev.payload().set("to", self.version.as_str()),
+        );
+        let data_dir = self.resolved_data_dir();
+        let mut applied = 0usize;
+        for d in &mut self.drivers {
+            let mut run = SchemaRun {
+                migrations: &self.migrations,
+                target: &self.version,
+                data_dir: &data_dir,
+                auto_rollback: self.auto_rollback,
+                retention: self.retention,
+                history: &mut self.history,
+                verify: self.verify.as_deref(),
+                baseline: self.baseline.as_deref(),
+                ev: &ev,
+                warn: &*self.warn,
+                applied: 0,
+            };
+            let result = run.run(d.as_mut(), ctx);
+            applied += run.applied;
+            if let Err(e) = result {
+                ev.emit(
+                    &ev.topics.run_failed,
+                    ev.payload()
+                        .set("to", self.version.as_str())
+                        .set("schema", d.name())
+                        .set("error", e.to_string())
+                        .set("duration_ms", millis(start)),
+                );
+                return Err(e);
+            }
+        }
+        ev.emit(
+            &ev.topics.run_completed,
+            ev.payload()
+                .set("to", self.version.as_str())
+                .set("applied", applied)
+                .set("duration_ms", millis(start)),
+        );
+        Ok(())
+    }
+
+    /// Restores every driver from its newest backup, then records the
+    /// version the run that took it started at (saved beside the
+    /// backup). A backup without that record is still restored, but the
+    /// version is left as it is and the error says so. A driver with a
+    /// [`Locker`](super::Locker) is locked for its schema's rollback (lock,
+    /// backup lookup, restore, record, unlock; a lock error is
+    /// `rollback <schema>: lock: <error>`); the version is not read. Manual
+    /// mode only.
+    pub fn rollback_latest(&mut self) -> Result<(), MigrateError> {
+        if self.auto_rollback {
+            return Err(MigrateError::RollbackUnavailable);
+        }
+        let data_dir = self.resolved_data_dir();
+        for d in &mut self.drivers {
+            let schema = d.name().to_string();
+            let fail = |source: BoxError| MigrateError::Rollback {
+                schema: schema.clone(),
+                source,
+            };
+            // Held until the end of this schema's iteration: the backup
+            // lookup, the restore and the version record are under the lock.
+            let _held = Held::acquire(d.as_locker(), &schema, &Context::background(), &*self.warn)
+                .map_err(|e| fail(format!("lock: {e}").into()))?;
+            let latest = Backups::new(&data_dir, &schema, self.retention)
+                .latest()
+                .map_err(|e: LatestError| match e {
+                    LatestError::Empty(_) => fail(Box::new(NotRestored::new(
+                        e.to_string(),
+                        Box::new(super::BackupUnsupported),
+                    ))),
+                    e => fail(e.into()),
+                })?;
+            let pre_run = Backups::read_pre_run(&latest).map_err(|e| fail(e.into()))?;
+            d.restore(&latest)
+                .map_err(|e| fail(super::unsupported::restore_error(e)))?;
+            let Some(pre_run) = pre_run else {
+                return Err(MigrateError::Rollback {
+                    schema: schema.clone(),
+                    source: format!(
+                        "restored {} but it records no pre-run version; version left as is",
+                        base_name(&latest)
+                    )
+                    .into(),
+                });
+            };
+            record(&data_dir, d.as_mut(), &pre_run).map_err(|e| MigrateError::Rollback {
+                schema: schema.clone(),
+                source: record_error(&pre_run, &e).into(),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn base_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Names a failed version record; an empty version (the store reads back
+/// as unversioned) is quoted. Go `recordError`.
+pub(super) fn record_error(version: &str, e: &BoxError) -> String {
+    let v = if version.is_empty() { "\"\"" } else { version };
+    format!("record {v} failed: {e}")
+}
+
+/// Records `version`: for a driver that stores its own version only
+/// `set_version`; otherwise the version file first, then `set_version`,
+/// so a refused `set_version` leaves the file at the new version. Go
+/// `setVersion`.
+pub(super) fn record(
+    data_dir: &Path,
+    d: &mut dyn SchemaDriver,
+    version: &str,
+) -> Result<(), BoxError> {
+    if d.stores_version() {
+        return d.set_version(version);
+    }
+    let dir = data_dir.join(d.name());
+    fs_util::create_dir_all(&dir).map_err(|e| format!("create version dir: {e}"))?;
+    fs_util::write_private(&dir.join("version"), version.as_bytes())
+        .map_err(|e| format!("write version file: {e}"))?;
+    d.set_version(version)
+}
+
+fn millis(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+struct Emitter<'a> {
+    tool: &'a str,
+    publisher: Option<&'a dyn MigrationPublisher>,
+    topics: &'a MigrationTopics,
+}
+
+impl Emitter<'_> {
+    fn payload(&self) -> Payload {
+        Payload::new(self.tool)
+    }
+
+    fn emit(&self, topic: &Topic, payload: Payload) {
+        if let Some(p) = self.publisher {
+            if !topic.as_str().is_empty() {
+                let event = Event::new(topic.clone(), SOURCE, payload.into_value());
+                p.publish(&Context::background(), &event);
+            }
+        }
+    }
+
+    fn step(&self, schema: &str, from: &str, to: &str) -> Payload {
+        self.payload()
+            .set("schema", schema)
+            .set("from", from)
+            .set("to", to)
+    }
+}
+
+/// What stopped a schema's run, with what to roll back.
+struct Failure<'m> {
+    kind: StepKind,
+    version: String,
+    source: BoxError,
+    undo: Vec<&'m Migration>,
+    /// The newest `undo` entry is a step whose `up` failed: it counts as
+    /// applied, but its `down` is never called.
+    up_failed: bool,
+}
+
+struct SchemaRun<'a> {
+    migrations: &'a [Migration],
+    target: &'a str,
+    data_dir: &'a Path,
+    auto_rollback: bool,
+    retention: usize,
+    history: &'a mut Vec<AppliedMigration>,
+    verify: Option<&'a FinalVerify>,
+    baseline: Option<&'a Baseline>,
+    ev: &'a Emitter<'a>,
+    warn: &'a (dyn Fn(&str) + Send + Sync),
+    applied: usize,
+}
+
+impl<'a> SchemaRun<'a> {
+    /// Takes the driver's lock, if it has one, and holds it until the
+    /// schema's run is over, rollback and prune included (released on
+    /// every path, a failed unlock is a warning).
+    fn run(&mut self, d: &mut dyn SchemaDriver, ctx: &Context) -> Result<(), MigrateError> {
+        let _held = Held::acquire(d.as_locker(), d.name(), ctx, self.warn).map_err(|source| {
+            MigrateError::Lock {
+                schema: d.name().to_string(),
+                source,
+            }
+        })?;
+        self.run_locked(d, ctx)
+    }
+
+    fn run_locked(&mut self, d: &mut dyn SchemaDriver, ctx: &Context) -> Result<(), MigrateError> {
+        let schema = d.name().to_string();
+        let current = d.version().map_err(|source| MigrateError::ReadVersion {
+            schema: schema.clone(),
+            source,
+        })?;
+        let current = if current.is_empty() {
+            self.stamp_baseline(d, ctx)?
+        } else {
+            current
+        };
+        let todo = pending(self.migrations, &schema, &current, self.target);
+        let Some(first) = todo.first() else {
+            return Ok(());
+        };
+
+        let backups = Backups::new(self.data_dir, &schema, self.retention);
+        let backup = take_backup(&backups, d, &first.version, &current)?;
+
+        if let Err(f) = self.apply_all(ctx, d, &current, &todo) {
+            return Err(self.fail(d, &schema, &current, backup, f));
+        }
+
+        // Non-fatal, as in Go, which logs it. A schema with no backup this
+        // run is left alone.
+        if matches!(backup, BackupState::Taken(_)) {
+            if let Err(e) = backups.prune() {
+                (self.warn)(&format!("warning: prune old backups for {schema}: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Asks the baseline function what the unversioned store is at and
+    /// records a non-empty answer; returns the version the run continues
+    /// from. The lock held for the schema covers this call: it sits between
+    /// the version read and the pending selection in `run`.
+    fn stamp_baseline(
+        &self,
+        d: &mut dyn SchemaDriver,
+        ctx: &Context,
+    ) -> Result<String, MigrateError> {
+        let Some(baseline) = self.baseline else {
+            return Ok(String::new());
+        };
+        let schema = d.name().to_string();
+        let fail = |source: BoxError| MigrateError::Baseline {
+            schema: schema.clone(),
+            source,
+        };
+        let v = baseline(ctx, &schema).map_err(fail)?;
+        if v.is_empty() {
+            return Ok(v);
+        }
+        record(self.data_dir, d, &v).map_err(|e| fail(record_error(&v, &e).into()))?;
+        self.ev
+            .emit(&self.ev.topics.baselined, self.ev.step(&schema, "", &v));
+        Ok(v)
+    }
+
+    fn apply_all<'m>(
+        &mut self,
+        ctx: &Context,
+        d: &mut dyn SchemaDriver,
+        current: &str,
+        todo: &[&'m Migration],
+    ) -> Result<(), Failure<'m>> {
+        let ev = self.ev;
+        let schema = d.name().to_string();
+        let schema = schema.as_str();
+        let mut from = current.to_string();
+        let mut done: Vec<&'m Migration> = Vec::new();
+        for &m in todo {
+            let base = || ev.step(schema, &from, &m.version);
+            if let Some(err) = ctx.err() {
+                return Err(self.failed(
+                    base(),
+                    StepKind::Canceled,
+                    &m.version,
+                    Box::new(err),
+                    done,
+                ));
+            }
+            ev.emit(&ev.topics.started, base());
+            let t = Instant::now();
+            if let Err(e) = (m.up)(ctx) {
+                // A failed `up` is an applied step that cannot be downed: it
+                // joins the undo list, newest, and its `down` is never called.
+                let mut undo = done;
+                undo.push(m);
+                let p = base().set("duration_ms", millis(t));
+                let mut f = self.failed(p, StepKind::Up, &m.version, e, undo);
+                f.up_failed = true;
+                return Err(f);
+            }
+            ev.emit(&ev.topics.applied, base().set("duration_ms", millis(t)));
+            if let Some(verify) = &m.verify {
+                let t = Instant::now();
+                if let Err(e) = verify(ctx) {
+                    // `up` completed: the rollback must undo this step too.
+                    let mut undo = done;
+                    undo.push(m);
+                    let p = base().set("duration_ms", millis(t));
+                    return Err(self.failed(p, StepKind::Verify, &m.version, e, undo));
+                }
+                ev.emit(&ev.topics.verified, base().set("duration_ms", millis(t)));
+            }
+            let t = Instant::now();
+            if let Err(e) = record(self.data_dir, d, &m.version) {
+                // `up` completed: the rollback must undo this step too.
+                let mut undo = done;
+                undo.push(m);
+                let p = base().set("duration_ms", millis(t));
+                return Err(self.failed(p, StepKind::Record, &m.version, e, undo));
+            }
+            done.push(m);
+            self.applied += 1;
+            self.history.push(AppliedMigration {
+                version: m.version.clone(),
+                schema: m.schema.clone(),
+            });
+            from = m.version.clone();
+        }
+        if let Some(verify) = self.verify {
+            let p = ev.step(schema, current, &from);
+            let t = Instant::now();
+            if let Err(e) = verify(ctx, schema, &from) {
+                let p = p.set("duration_ms", millis(t));
+                return Err(self.failed(p, StepKind::FinalVerify, &from, e, done));
+            }
+            ev.emit(
+                &ev.topics.verified,
+                p.set("final", true).set("duration_ms", millis(t)),
+            );
+        }
+        Ok(())
+    }
+
+    fn failed<'m>(
+        &self,
+        payload: Payload,
+        kind: StepKind,
+        version: &str,
+        source: BoxError,
+        undo: Vec<&'m Migration>,
+    ) -> Failure<'m> {
+        self.ev.emit(
+            &self.ev.topics.failed,
+            payload
+                .set("stage", kind.stage())
+                .set("error", source.to_string()),
+        );
+        Failure {
+            kind,
+            version: version.to_string(),
+            source,
+            undo,
+            up_failed: false,
+        }
+    }
+
+    /// Rolls back in auto mode and builds the schema's error.
+    fn fail(
+        &self,
+        d: &mut dyn SchemaDriver,
+        schema: &str,
+        current: &str,
+        backup: BackupState,
+        f: Failure<'_>,
+    ) -> MigrateError {
+        let mut rollback = None;
+        if self.auto_rollback && !f.undo.is_empty() {
+            let t = Instant::now();
+            match roll_back(self.data_dir, d, current, &f.undo, f.up_failed, backup) {
+                Ok(method) => self.ev.emit(
+                    &self.ev.topics.reverted,
+                    self.ev
+                        .step(schema, &f.version, current)
+                        .set("method", method)
+                        .set("duration_ms", millis(t)),
+                ),
+                Err(e) => rollback = Some(e),
+            }
+        }
+        MigrateError::Step {
+            schema: schema.to_string(),
+            kind: f.kind,
+            version: f.version,
+            source: f.source,
+            rollback,
+        }
+    }
+}
